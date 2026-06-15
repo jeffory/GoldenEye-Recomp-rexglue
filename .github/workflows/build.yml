@@ -20,7 +20,7 @@ jobs:
     name: Linux AMD64 (Clang)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -29,13 +29,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             clang lld ninja-build pkg-config \
+            libc++-dev libc++abi-dev \
             libgtk-3-dev libx11-xcb-dev libxcb1-dev
           clang --version
 
       - uses: lukka/get-cmake@latest
 
+      # The SDK targets libc++ on Unix (it force-adds -fexperimental-library for
+      # std::jthread/stop_token, and uses std::expected). Build against libc++.
       - name: Configure
-        run: cmake --preset linux-amd64
+        run: >
+          cmake --preset linux-amd64
+          -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -stdlib=libc++"
+          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
+          -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
+          -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++"
 
       - name: Build (Release)
         run: cmake --build --preset linux-amd64-release
@@ -46,14 +54,14 @@ jobs:
           name: rexglue-linux-amd64
           if-no-files-found: warn
           path: |
-            out/build/linux-amd64/**/*.so
-            out/build/linux-amd64/**/*.a
+            out/linux-amd64/**/*.so
+            out/linux-amd64/**/*.a
 
   windows-amd64:
     name: Windows AMD64 (Clang)
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -84,15 +92,15 @@ jobs:
           name: rexglue-windows-amd64
           if-no-files-found: warn
           path: |
-            out/build/win-amd64/**/*.dll
-            out/build/win-amd64/**/*.lib
-            out/build/win-amd64/**/*.exe
+            out/win-amd64/**/*.dll
+            out/win-amd64/**/*.lib
+            out/win-amd64/**/*.exe
 
   android-arm64:
     name: Android arm64-v8a (NDK)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           submodules: recursive
 
@@ -130,4 +138,4 @@ jobs:
         with:
           name: rexglue-android-arm64-v8a
           if-no-files-found: warn
-          path: out/build/android-arm64/**/*.so
+          path: out/android-arm64-v8a/**/*.so
