@@ -96,6 +96,11 @@ class AudioSystem : public system::IAudioSystem {
   bool paused_ = false;
   rex::thread::Fence pause_fence_;
   std::unique_ptr<rex::thread::Event> resume_event_;
+  // Signalled by RegisterClient to wake the audio worker out of its idle sleep
+  // immediately, so it pumps the new client's first frame promptly instead of
+  // up to ~500ms later. Without this the guest's audio init can time out and
+  // tear the audio object down (the intermittent boot-time get-or-create churn).
+  std::unique_ptr<rex::thread::Event> client_registered_event_;
 };
 
 }  // namespace rex::audio

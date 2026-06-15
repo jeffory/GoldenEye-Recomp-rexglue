@@ -16,6 +16,15 @@ add_library(rexaudio OBJECT
 )
 add_library(rex::audio ALIAS rexaudio)
 
+if(ANDROID)
+    # Native Android backend (no SDL/JNI dependency; SDL audio cannot init under
+    # a bare NativeActivity).
+    target_sources(rexaudio PRIVATE
+        android/android_audio_system.cpp
+        android/android_audio_driver.cpp
+    )
+endif()
+
 target_include_directories(rexaudio PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>

@@ -93,9 +93,19 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
         "VK_KHR_get_physical_device_properties2",
         &vulkan_instance->extensions_.ext_1_1_KHR_get_physical_device_properties2);
   }
-  // #129.
-  requested_extensions.emplace("VK_EXT_debug_utils",
-                               &vulkan_instance->extensions_.ext_EXT_debug_utils);
+  // #129. VK_EXT_debug_utils only drives debug aids (the validation messenger
+  // and object naming), so request it only when actually debugging. Beyond
+  // avoiding pointless work in normal runs, some Vulkan implementations crash in
+  // vkSetDebugUtilsObjectNameEXT - notably the Android emulator's ARM-translation
+  // Vulkan proxy (libndk_translation_proxy_libvulkan) faults at null+0x40.
+  // Skipping the extension makes Device::SetObjectName a no-op (it is gated on
+  // ext_EXT_debug_utils) with no gameplay impact - object naming only labels
+  // handles for an attached GPU debugger. Gate on validation only (NOT on
+  // vulkan_log_debug_messages, which defaults true).
+  if (try_enable_validation) {
+    requested_extensions.emplace("VK_EXT_debug_utils",
+                                 &vulkan_instance->extensions_.ext_EXT_debug_utils);
+  }
   // #395.
   requested_extensions.emplace("VK_KHR_portability_enumeration",
                                &vulkan_instance->extensions_.ext_KHR_portability_enumeration);

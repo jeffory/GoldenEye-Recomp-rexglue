@@ -158,6 +158,16 @@ class WindowedApp {
     return it != creators_->end() ? it->second : nullptr;
   }
 
+  // Returns the sole registered creator (or the first, if several), or nullptr
+  // if none are registered. The Android entry point uses this because a recomp
+  // library ships exactly one app and has no command line to select by name.
+  static Creator GetAnyCreator() {
+    if (!creators_ || creators_->empty()) {
+      return nullptr;
+    }
+    return creators_->begin()->second;
+  }
+
  private:
   static std::unordered_map<std::string, Creator>* creators_;
 #endif  // XE_UI_WINDOWED_APPS_IN_LIBRARY

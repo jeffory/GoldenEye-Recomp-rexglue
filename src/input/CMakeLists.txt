@@ -14,6 +14,8 @@ target_include_directories(rexinput PUBLIC
 )
 if(WIN32)
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp xinput/xinput_input_driver.cpp)
+elseif(ANDROID)
+    target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp android/android_input_driver.cpp)
 else()
     target_sources(rexinput PRIVATE sdl/sdl_input_driver.cpp)
 endif()

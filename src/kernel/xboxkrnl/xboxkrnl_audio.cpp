@@ -70,6 +70,10 @@ u32 XAudioRegisterRenderDriverClient_entry(mapped_u32 callback_ptr, mapped_u32 d
 
   size_t index;
   auto result = audio_system->RegisterClient(callback, callback_arg, &index);
+  // [TEMP GEAUDREG] one-shot: did the guest's audio register SUCCEED, and how many
+  // register cycles (churn)? Compare timestamp vs GEAUDUNREG to see register->teardown.
+  { static int _n = 0; if (_n < 12) { REXKRNL_INFO("GEAUDREG #{} result={:#x} cb={:08X}", _n,
+        static_cast<uint32_t>(result), callback); _n++; } }
   if (XFAILED(result)) {
     return result;
   }
@@ -84,6 +88,9 @@ u32 XAudioUnregisterRenderDriverClient_entry(mapped_void driver_ptr) {
 
   auto* audio_system =
       static_cast<audio::AudioSystem*>(REX_KERNEL_STATE()->emulator()->audio_system());
+  // [TEMP GEAUDUNREG] one-shot: the guest tearing the audio client down (the churn).
+  { static int _u = 0; if (_u < 12) { REXKRNL_INFO("GEAUDUNREG #{} driver={:08X}", _u,
+        driver_ptr.guest_address()); _u++; } }
   audio_system->UnregisterClient(driver_ptr.guest_address() & 0x0000FFFF);
   return X_ERROR_SUCCESS;
 }

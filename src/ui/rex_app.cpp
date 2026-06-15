@@ -29,6 +29,9 @@
 #endif
 #include <rex/audio/audio_system.h>
 #include <rex/audio/sdl/sdl_audio_system.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/audio/android/android_audio_system.h>
+#endif
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
 #include <rex/system.h>
@@ -286,7 +289,13 @@ bool ReXApp::SetupPresentation() {
 #elif REX_HAS_VULKAN
   config_.graphics = REX_GRAPHICS_BACKEND(rex::graphics::vulkan::VulkanGraphicsSystem);
 #endif
+#if REX_PLATFORM_ANDROID
+  // SDL's audio backend requires the Java SDLActivity and cannot initialize
+  // under our bare NativeActivity, so use the native Android backend.
+  config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::android::AndroidAudioSystem);
+#else
   config_.audio_factory = REX_AUDIO_BACKEND(rex::audio::sdl::SDLAudioSystem);
+#endif
   config_.input_factory = REX_INPUT_BACKEND(rex::input::CreateDefaultInputSystem);
   config_.kernel_init = rex::kernel::InitializeKernel;
 

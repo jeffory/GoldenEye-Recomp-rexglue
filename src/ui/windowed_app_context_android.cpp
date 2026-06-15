@@ -1,0 +1,179 @@
+/**
+ ******************************************************************************
+ * Xenia : Xbox 360 Emulator Research Project                                 *
+ ******************************************************************************
+ * Copyright 2021 Ben Vanik. All rights reserved.                             *
+ * Released under the BSD license - see LICENSE in the root for more details. *
+ ******************************************************************************
+ *
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ * @modified    Android backend, 2026
+ */
+
+#include <rex/ui/windowed_app_context_android.h>
+
+#include <android/looper.h>
+#include <android/native_activity.h>
+#include <android/native_window.h>
+#include <android_native_app_glue.h>
+
+#include <rex/logging.h>
+#include <rex/ui/window_android.h>
+
+#include <cstdio>  // [TEMP DEBUG] input-ANR diagnosis
+
+namespace rex {
+namespace ui {
+
+namespace {
+// Directly drain and finish any pending events on the app's input queue,
+// mirroring android_native_app_glue's process_input. We call this every loop
+// iteration rather than relying solely on the looper waking for
+// LOOPER_ID_INPUT: on some devices/launchers (notably an external frontend that
+// contends for window focus) the input-queue fd does not reliably wake the
+// looper, which would leave key events undrained and trip the 5 s input-
+// dispatch ANR. Runs on the UI loop thread only, so it never races the glue's
+// own process_input; each event is finished exactly once.
+void DrainAndroidInputQueue(android_app* app) {
+  if (!app || !app->inputQueue) {
+    return;
+  }
+  AInputEvent* event = nullptr;
+  while (AInputQueue_getEvent(app->inputQueue, &event) >= 0) {
+    if (AInputQueue_preDispatchEvent(app->inputQueue, event)) {
+      continue;
+    }
+    int32_t handled = 0;
+    if (app->onInputEvent) {
+      handled = app->onInputEvent(app, event);
+    }
+    AInputQueue_finishEvent(app->inputQueue, event, handled);
+  }
+}
+}  // namespace
+
+AndroidWindowedAppContext::AndroidWindowedAppContext(android_app* app) : app_(app) {
+  app_->userData = this;
+  app_->onAppCmd = &AndroidWindowedAppContext::OnAppCmdThunk;
+  app_->onInputEvent = &AndroidWindowedAppContext::OnInputEventThunk;
+}
+
+AndroidWindowedAppContext::~AndroidWindowedAppContext() {
+  if (app_) {
+    app_->onAppCmd = nullptr;
+    app_->onInputEvent = nullptr;
+    if (app_->userData == this) {
+      app_->userData = nullptr;
+    }
+  }
+}
+
+void AndroidWindowedAppContext::NotifyUILoopOfPendingFunctions() {
+  // Wake the looper so the next RunMainAndroidLoop iteration drains the queue.
+  if (app_ && app_->looper) {
+    ALooper_wake(app_->looper);
+  }
+}
+
+void AndroidWindowedAppContext::PlatformQuitFromUIThread() {
+  quit_requested_ = true;
+  if (app_ && app_->activity) {
+    ANativeActivity_finish(app_->activity);
+  }
+}
+
+void AndroidWindowedAppContext::RunMainAndroidLoop() {
+  // For safety, in case the quit request somehow happened before the loop.
+  if (HasQuitFromUIThread()) {
+    return;
+  }
+  while (!HasQuitFromUIThread()) {
+    int events;
+    android_poll_source* source = nullptr;
+    // Wake at least once per frame (~16 ms). The guest renders/presents on its
+    // own GPU/CP threads, so this loop only pumps Android lifecycle + input and
+    // must not busy-spin (timeout 0 burns a core). We also do NOT block forever:
+    // the input-queue fd does not reliably wake this looper on every device, so
+    // a frame-paced timeout plus the explicit DrainAndroidInputQueue() below
+    // guarantees key events are dispatched and finished promptly (no ANR).
+    int ident = ALooper_pollOnce(16, nullptr, &events, reinterpret_cast<void**>(&source));
+    if (ident >= 0 && source) {
+      source->process(app_, source);  // dispatches to OnAppCmd / input
+    }
+    DrainAndroidInputQueue(app_);
+    if (app_->destroyRequested) {
+      QuitFromUIThread();
+      return;
+    }
+    ExecutePendingFunctionsFromUIThread();
+    if (window_) {
+      // Drive the actual paint/present from the UI loop. AndroidWindow's
+      // RequestPaintImpl is a no-op (there's no OS-driven repaint callback like
+      // GTK's draw signal), so without this the presenter's PaintAndPresent is
+      // never called and the guest output is never composited to the swapchain
+      // -> black screen. force_paint=true: the swapchain image isn't retained
+      // between frames, so always re-present the latest guest output.
+      window_->PaintFromUiThreadIfRequested();
+    }
+  }
+}
+
+void AndroidWindowedAppContext::OnAppCmdThunk(android_app* app, int32_t cmd) {
+  static_cast<AndroidWindowedAppContext*>(app->userData)->HandleAppCmd(cmd);
+}
+
+int32_t AndroidWindowedAppContext::OnInputEventThunk(android_app* app, AInputEvent* event) {
+  return static_cast<AndroidWindowedAppContext*>(app->userData)->HandleInputEvent(event);
+}
+
+void AndroidWindowedAppContext::HandleAppCmd(int32_t cmd) {
+  switch (cmd) {
+    case APP_CMD_INIT_WINDOW:
+      // The OS created the surface window - hand it to the active window.
+      if (window_ && app_->window) {
+        window_->SetNativeWindow(app_->window);
+      }
+      break;
+    case APP_CMD_TERM_WINDOW:
+      // The surface is going away; detach before the OS destroys it.
+      if (window_) {
+        window_->SetNativeWindow(nullptr);
+      }
+      break;
+    case APP_CMD_WINDOW_RESIZED:
+    case APP_CMD_CONFIG_CHANGED:
+      if (window_) {
+        window_->OnAndroidResized();
+      }
+      break;
+    case APP_CMD_GAINED_FOCUS:
+      if (window_) {
+        window_->OnAndroidFocusChanged(true);
+      }
+      break;
+    case APP_CMD_LOST_FOCUS:
+      if (window_) {
+        window_->OnAndroidFocusChanged(false);
+      }
+      break;
+    case APP_CMD_DESTROY:
+      QuitFromUIThread();
+      break;
+    default:
+      break;
+  }
+}
+
+int32_t AndroidWindowedAppContext::HandleInputEvent(AInputEvent* event) {
+  // Forward to the Android input driver (registered as the window's input sink)
+  // which maps gamepad key/motion events into the Xbox 360 controller state.
+  if (window_) {
+    if (AndroidInputSink* sink = window_->android_input_sink()) {
+      return sink->OnAndroidInputEvent(event);
+    }
+  }
+  return 0;
+}
+
+}  // namespace ui
+}  // namespace rex

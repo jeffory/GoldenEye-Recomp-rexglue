@@ -61,6 +61,12 @@ if(WIN32)
         window_win.cpp
         windowed_app_context_win.cpp
     )
+elseif(ANDROID)
+    set(REXUI_PLATFORM_SOURCES
+        surface_android.cpp
+        window_android.cpp
+        windowed_app_context_android.cpp
+    )
 else()
     set(REXUI_PLATFORM_SOURCES
         surface_gnulinux.cpp
@@ -135,6 +141,18 @@ if(WIN32)
     target_link_libraries(rexui PUBLIC
         dwmapi
         Shcore
+    )
+elseif(ANDROID)
+    # Android: native window + log come from the NDK sysroot. No GTK/X11.
+    # The Vulkan surface is created via VK_KHR_android_surface (loaded by volk).
+    # windowed_app_context_android.cpp includes <android_native_app_glue.h>
+    # (header only here; the glue .c is compiled into the app target).
+    target_include_directories(rexui PRIVATE
+        ${CMAKE_ANDROID_NDK}/sources/android/native_app_glue
+    )
+    target_link_libraries(rexui PUBLIC
+        android
+        log
     )
 else()
     find_package(PkgConfig REQUIRED)

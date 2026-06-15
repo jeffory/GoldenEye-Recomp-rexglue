@@ -65,6 +65,9 @@ AudioSystem::AudioSystem(runtime::FunctionDispatcher* function_dispatcher)
 
   resume_event_ = rex::thread::Event::CreateAutoResetEvent(false);
   assert_not_null(resume_event_);
+
+  client_registered_event_ = rex::thread::Event::CreateAutoResetEvent(false);
+  assert_not_null(client_registered_event_);
 }
 
 AudioSystem::~AudioSystem() {
@@ -160,8 +163,13 @@ void AudioSystem::WorkerThreadMain() {
     }
 
     if (!pumped) {
-      SCOPE_profile_cpu_i("apu", "Sleep");
-      rex::thread::Sleep(std::chrono::milliseconds(500));
+      // Idle throttle, but interruptible: a newly-registered client signals
+      // client_registered_event_ so we wake immediately and pump its first frame
+      // (a plain Sleep here created a ~500ms dead window in which client
+      // registrations went unserviced, and the guest tore the audio object down
+      // before its first callback -> intermittent boot churn / black screen).
+      SCOPE_profile_cpu_i("apu", "Idle");
+      rex::thread::Wait(client_registered_event_.get(), false, std::chrono::milliseconds(500));
     }
   }
   worker_running_ = false;
@@ -240,6 +248,12 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
   memory::store_and_swap<uint32_t>(memory()->TranslateVirtual(ptr), callback_arg);
 
   clients_[index] = {driver, callback, callback_arg, ptr, true};
+
+  // Wake the worker out of any idle sleep NOW so it services this client's
+  // already-primed semaphore on the next loop iteration, rather than up to
+  // ~500ms later. The callback above is set before we signal, so the worker
+  // (which re-takes global_critical_region_ to read it) always sees it.
+  client_registered_event_->Set();
 
   if (out_index) {
     *out_index = index;

@@ -16,6 +16,9 @@
 #include <rex/input/flags.h>
 #include <rex/input/input_driver.h>
 #include <rex/input/input_system.h>
+#if REX_PLATFORM_ANDROID
+#include <rex/input/android/android_input_driver.h>
+#endif
 #include <rex/input/mnk/mnk_input_driver.h>
 #include <rex/input/nop/nop_input_driver.h>
 #include <rex/input/sdl/sdl_input_driver.h>
@@ -163,6 +166,15 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
   auto input = std::make_unique<InputSystem>(nullptr);
 
   if (!tool_mode) {
+#if REX_PLATFORM_ANDROID
+    // Primary controller path on Android: NDK gamepad events from the
+    // NativeActivity input queue (Not SDL, which needs SDLActivity).
+    auto android_driver = std::make_unique<android::AndroidInputDriver>(nullptr, 0);
+    if (android_driver->Setup() == X_STATUS_SUCCESS) {
+      input->AddDriver(std::move(android_driver));
+    }
+#endif
+
 #if REX_PLATFORM_WIN32
     if (REXCVAR_GET(input_backend) == "xinput") {
       auto xinput_driver = std::make_unique<xinput::XinputInputDriver>(nullptr, 0);
@@ -172,12 +184,20 @@ std::unique_ptr<InputSystem> CreateDefaultInputSystem(bool tool_mode) {
     }
 #endif
 
+#if !REX_PLATFORM_ANDROID
+    // NOT on Android: SDL's input driver pumps SDL events on the UI thread
+    // (QueueControllerUpdate -> SDL_PumpEvents -> Android_PumpEvents), and SDL's
+    // Android backend blocks indefinitely in Android_WaitLifecycleEvent waiting
+    // for SDLActivity lifecycle signals that never come under our NativeActivity.
+    // That wedges RunMainAndroidLoop so it never drains the input queue -> input
+    // ANR. The AndroidInputDriver above is the controller path on Android.
     if (REXCVAR_GET(input_backend) == "sdl") {
       auto sdl_driver = std::make_unique<sdl::SDLInputDriver>(nullptr, 0);
       if (sdl_driver->Setup() == X_STATUS_SUCCESS) {
         input->AddDriver(std::move(sdl_driver));
       }
     }
+#endif
 
     // MnK driver (keyboard/mouse -> controller emulation)
     auto mnk_driver = std::make_unique<mnk::MnkInputDriver>(nullptr, 0);
