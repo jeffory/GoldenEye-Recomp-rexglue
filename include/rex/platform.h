@@ -99,6 +99,16 @@
 #include <libkern/OSByteOrder.h>
 #endif  // REX_PLATFORM_MAC
 
+#if REX_PLATFORM_ANDROID
+#include <android/api-level.h>
+namespace rex {
+// Device API level (e.g. 26 for Android 8.0). Used to gate runtime-loaded
+// libandroid symbols (ASharedMemory_create, etc.). Inline so both
+// memory_posix.cpp and threading_posix.cpp can use it without a new TU.
+inline int GetAndroidApiLevel() { return android_get_device_api_level(); }
+}  // namespace rex
+#endif  // REX_PLATFORM_ANDROID
+
 #include <bit>
 #include <cstdint>
 

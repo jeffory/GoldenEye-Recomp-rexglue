@@ -14,6 +14,8 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <mutex>
+#include <unordered_map>
 #include <string>
 
 #include <fcntl.h>
@@ -153,6 +155,66 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   return false;
 }
 
+// Fast per-page protection shadow.
+//
+// Parsing /proc/self/maps in QueryProtect (and in Protect when the old access is
+// requested) is a severe hot-path cost: the guest's write-watch mechanism faults
+// on every write to a watched page, and MMIOHandler::ExceptionCallback then calls
+// QueryProtect, re-reading and re-parsing the entire maps file each time. On a
+// busy title this dominates the CPU and the game crawls.
+//
+// All protection changes within the guest region funnel through Protect()/
+// DeallocFixed(), so we record the per-page access here and answer QueryProtect /
+// old-access lookups in O(1). Any page we have not recorded falls back to the
+// /proc/self/maps scan, so correctness is unchanged - the shadow is purely a
+// fast path for the pages the fault loop actually touches.
+std::mutex g_prot_shadow_mutex;
+std::unordered_map<uintptr_t, PageAccess> g_prot_shadow;
+
+static void ShadowSet(void* base_address, size_t length, PageAccess access) {
+  const size_t ps = page_size();
+  if (!base_address || !length || !ps) {
+    return;
+  }
+  uintptr_t a = reinterpret_cast<uintptr_t>(base_address) & ~(static_cast<uintptr_t>(ps) - 1);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(base_address) + length;
+  std::lock_guard<std::mutex> lock(g_prot_shadow_mutex);
+  for (; a < end; a += ps) {
+    g_prot_shadow[a] = access;
+  }
+}
+
+static void ShadowErase(void* base_address, size_t length) {
+  const size_t ps = page_size();
+  if (!base_address || !length || !ps) {
+    return;
+  }
+  uintptr_t a = reinterpret_cast<uintptr_t>(base_address) & ~(static_cast<uintptr_t>(ps) - 1);
+  const uintptr_t end = reinterpret_cast<uintptr_t>(base_address) + length;
+  std::lock_guard<std::mutex> lock(g_prot_shadow_mutex);
+  for (; a < end; a += ps) {
+    g_prot_shadow.erase(a);
+  }
+}
+
+// Returns true and sets access_out if the page containing base_address is in the
+// shadow.
+static bool ShadowQuery(void* base_address, PageAccess& access_out) {
+  const size_t ps = page_size();
+  if (!ps) {
+    return false;
+  }
+  const uintptr_t page =
+      reinterpret_cast<uintptr_t>(base_address) & ~(static_cast<uintptr_t>(ps) - 1);
+  std::lock_guard<std::mutex> lock(g_prot_shadow_mutex);
+  auto it = g_prot_shadow.find(page);
+  if (it == g_prot_shadow.end()) {
+    return false;
+  }
+  access_out = it->second;
+  return true;
+}
+
 // Check if [base, base+length) is fully covered by existing mappings (no gaps)
 static bool IsRangeFullyMapped(void* base_address, size_t length) {
   if (!base_address || length == 0)
@@ -266,10 +328,19 @@ bool DeallocFixed(void* base_address, size_t length, DeallocationType deallocati
 #if defined(MADV_DONTNEED)
       (void)madvise(base_address, length, MADV_DONTNEED);
 #endif
+#if REX_PLATFORM_LINUX
+      ShadowSet(base_address, length, PageAccess::kNoAccess);
+#endif
       return true;
     }
     case DeallocationType::kRelease: {
-      return munmap(base_address, length) == 0;
+      bool ok = munmap(base_address, length) == 0;
+#if REX_PLATFORM_LINUX
+      if (ok) {
+        ShadowErase(base_address, length);
+      }
+#endif
+      return ok;
     }
     default:
       // how we get here? :(
@@ -288,17 +359,29 @@ bool Protect(void* base_address, size_t length, PageAccess access, PageAccess* o
   //             but there is a TOCTOU window between reading and changing.
   //             This really shouldn't be an issue since VirtualProtect on Windows isn't truly
   //             atomic in a mutli-threaded process either, but it's something to be aware of.
-  // Query old access before changing, if the caller needs it
+  // Query old access before changing, if the caller needs it. Prefer the fast
+  // shadow; fall back to /proc/self/maps for pages we have not recorded.
   if (out_old_access) {
-    LinuxMapEntry e;
-    if (FindEntryForAddress(base_address, e)) {
-      *out_old_access = PermsToPageAccess(e.perms);
+    PageAccess old_access;
+    if (ShadowQuery(base_address, old_access)) {
+      *out_old_access = old_access;
+    } else {
+      LinuxMapEntry e;
+      if (FindEntryForAddress(base_address, e)) {
+        *out_old_access = PermsToPageAccess(e.perms);
+      }
     }
   }
 #endif
 
   uint32_t prot = ToPosixProtectFlags(access);
-  return mprotect(base_address, length, prot) == 0;
+  if (mprotect(base_address, length, prot) != 0) {
+    return false;
+  }
+#if REX_PLATFORM_LINUX
+  ShadowSet(base_address, length, access);
+#endif
+  return true;
 }
 
 bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
@@ -309,6 +392,16 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
 #else
   access_out = PageAccess::kNoAccess;
   length = 0;
+
+  // Fast path: per-page protection shadow (avoids parsing /proc/self/maps on the
+  // MMIO/write-watch fault hot path). Returns a single page's worth - the only
+  // caller (MMIOHandler::ExceptionCallback) queries exactly one page.
+  PageAccess shadow_access;
+  if (ShadowQuery(base_address, shadow_access)) {
+    access_out = shadow_access;
+    length = page_size();
+    return true;
+  }
 
   LinuxMapEntry e;
   if (!FindEntryForAddress(base_address, e)) {

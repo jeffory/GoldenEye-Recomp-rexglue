@@ -116,6 +116,31 @@ using XSystemClock = detail::NtSystemClock<detail::Domain::Guest>;
 
 namespace std::chrono {
 
+#ifdef _LIBCPP_VERSION
+// libc++ (used by the Android NDK) does not implement the C++20
+// std::chrono::clock_cast / clock_time_conversion machinery that desktop
+// libstdc++ and the MSVC STL provide. Supply the minimal subset this codebase
+// relies on: the primary template, an identity conversion, and a clock_cast
+// that dispatches to the user-provided clock_time_conversion specializations
+// (the WinSystemClock <-> XSystemClock ones defined immediately below). On
+// libstdc++/MSVC these names already exist, so the shim is compiled out.
+template <class Dest, class Source>
+struct clock_time_conversion;
+
+template <class Clock>
+struct clock_time_conversion<Clock, Clock> {
+  template <class Duration>
+  time_point<Clock, Duration> operator()(const time_point<Clock, Duration>& t) const {
+    return t;
+  }
+};
+
+template <class Dest, class Source, class Duration>
+auto clock_cast(const time_point<Source, Duration>& t) {
+  return clock_time_conversion<Dest, Source>{}(t);
+}
+#endif  // _LIBCPP_VERSION
+
 template <>
 struct clock_time_conversion<::rex::chrono::WinSystemClock, ::rex::chrono::XSystemClock> {
   using WClock_ = ::rex::chrono::WinSystemClock;

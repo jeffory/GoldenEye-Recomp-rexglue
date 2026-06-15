@@ -40,7 +40,10 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #if REX_PLATFORM_ANDROID
 #include <dlfcn.h>
 
-#include <rex/main_android.h>
+// NOTE: <rex/main_android.h> (Xenia's JNI/app-entry glue) is not present in this
+// SDK and nothing in this TU needs it. rex::thread::AndroidInitialize/Shutdown
+// are declared in <rex/thread.h>. The Android app entry point is a separate
+// deliverable (windowed_app_main_android, Phase 2).
 #include <rex/string/util.h>
 #endif
 
@@ -216,8 +219,10 @@ bool SetTlsValue(TlsHandle handle, uintptr_t value) {
 class PosixConditionBase {
  public:
   PosixConditionBase() {
-#if REX_PLATFORM_LINUX
+#if REX_PLATFORM_LINUX && !REX_PLATFORM_ANDROID
     // Use robust mutexes so waits can recover if owner thread terminates.
+    // bionic (Android) has no robust-mutex support, so this is glibc-only; the
+    // Android fallback is a plain std::mutex (no owner-death recovery).
     pthread_mutexattr_t attr;
     if (pthread_mutexattr_init(&attr) == 0) {
       if (pthread_mutexattr_setrobust(&attr, PTHREAD_MUTEX_ROBUST) == 0) {
@@ -240,7 +245,9 @@ class PosixConditionBase {
     auto native_mutex = static_cast<pthread_mutex_t*>(mutex_.native_handle());
     int lock_result = pthread_mutex_lock(native_mutex);
     if (lock_result == EOWNERDEAD) {
-      pthread_mutex_consistent(native_mutex);
+#if !REX_PLATFORM_ANDROID
+      pthread_mutex_consistent(native_mutex);  // never hit on bionic (no robust mutex)
+#endif
     } else if (lock_result != 0) {
       return WaitResult::kFailed;
     }
@@ -295,7 +302,9 @@ class PosixConditionBase {
         int result = pthread_mutex_trylock(native_mutex);
         if (result == 0 || result == EOWNERDEAD) {
           if (result == EOWNERDEAD) {
-            pthread_mutex_consistent(native_mutex);
+#if !REX_PLATFORM_ANDROID
+            pthread_mutex_consistent(native_mutex);  // never hit on bionic
+#endif
           }
           locks.emplace_back(handles[i]->mutex_, std::adopt_lock);
         } else {

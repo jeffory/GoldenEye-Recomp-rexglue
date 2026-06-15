@@ -9,6 +9,7 @@
  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
  */
 
+#include <atomic>
 #include <algorithm>
 #include <cstring>
 #include <utility>
@@ -416,9 +417,13 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
     }
     // The address is not found within any range, so either a write watch or an
     // actual access violation.
+    bool handled = false;
     if (access_violation_callback_) {
-      return access_violation_callback_(std::move(lock), access_violation_callback_context_,
-                                        fault_host_address, is_write);
+      handled = access_violation_callback_(std::move(lock), access_violation_callback_context_,
+                                           fault_host_address, is_write);
+    }
+    if (handled) {
+      return true;
     }
     return false;
   }

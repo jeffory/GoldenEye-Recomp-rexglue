@@ -51,6 +51,18 @@ struct Fiber {
 #if REX_PLATFORM_WIN32
   void* handle_ = nullptr;
   bool is_thread_fiber_ = false;
+#elif REX_PLATFORM_ANDROID
+  // bionic has no ucontext swap functions; use a custom AArch64 context switch
+  // (fiber_android_arm64.S). sp_ is the saved stack pointer of a suspended
+  // fiber (a callee-saved register frame on its own stack); for a thread-fiber
+  // it is filled in on the first SwitchTo away from it.
+  void* sp_ = nullptr;
+  std::vector<uint8_t> stack_;
+  void (*entry_)(void*) = nullptr;
+  void* arg_ = nullptr;
+  bool is_thread_fiber_ = false;
+
+  static void Trampoline();
 #elif REX_PLATFORM_LINUX
   ucontext_t context_{};
   std::vector<uint8_t> stack_;

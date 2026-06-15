@@ -847,20 +847,28 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
-  // GoldenEye GPU render-worker deadlock guard. Threads whose guest entry is
-  // sub_821A4A68 are the deferred GPU command workers. Their lock-free hand-off
-  // with the GPU interrupt was written for the 360's single-core model (CPU2's
-  // thread and CPU2's GPU interrupt interleave on ONE core); under emulation they
-  // run truly in parallel on separate host cores, so under load a wakeup can be
-  // lost and the worker is left on an INFINITE wait -> it never resubmits, the
-  // command ring drains, and the screen freezes while everything else keeps
-  // running. The worker resubmits from its OWN wait-timeout path, so we never let
-  // it wait forever: turn an infinite wait into the worker's normal ~30ms timeout
-  // so any lost wakeup self-heals within 30ms. Affects only these worker threads.
+  // GoldenEye lost-wakeup deadlock guard. Several GoldenEye worker threads use a
+  // lock-free hand-off that was written for the 360's single-core model (a thread
+  // and the interrupt/producer that wakes it interleave on ONE core); under
+  // emulation they run truly in parallel on separate host cores, so a wakeup can
+  // be lost and the worker is left on an INFINITE wait -> it never resumes its
+  // loop, and the subsystem it drives stalls while everything else keeps running.
+  // Each such worker is a wait-at-top-of-loop that re-checks its state and
+  // re-drives the pipeline on wakeup, so a spurious timeout is harmless: we never
+  // let these wait forever, turning an infinite wait into a short timeout so any
+  // lost wakeup self-heals. Affects only these specific worker threads.
+  //   - sub_821A4A68: deferred GPU command workers (ring drains -> screen freeze).
+  //   - sub_82366628: the audio client worker. It waits on the per-frame audio
+  //     event 0x8308EC24; when its first wakeup is lost at boot it blocks forever,
+  //     and because the boot init gates on the audio subsystem coming up, the
+  //     WHOLE boot stalls before the first frame (intermittent ~50% black boot).
+  //     Diagnosed via the infinite-wait tracer: a single stuck KeWaitForSingleObject
+  //     on 0x8308EC24, gstart=0x82366628, identical on every black boot.
   uint64_t capped_timeout;
   if (!timeout_ptr) {
     auto* cur = XThread::GetCurrentThread();
-    if (cur && cur->creation_params()->start_address == 0x821A4A68u) {
+    uint32_t start = cur ? cur->creation_params()->start_address : 0u;
+    if (start == 0x821A4A68u || start == 0x82366628u) {
       capped_timeout = static_cast<uint64_t>(static_cast<int64_t>(-300000));  // -30ms (NT 100ns units)
       timeout_ptr = &capped_timeout;
     }

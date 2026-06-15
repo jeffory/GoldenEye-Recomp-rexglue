@@ -64,6 +64,17 @@ elseif(UNIX)
     )
 endif()
 
+# Android fibers need a hand-written AArch64 context switch (bionic has no
+# ucontext swap functions); fiber_posix.cpp's Android path calls into it.
+# platform_android_jni.cpp bridges low-level code to the JavaVM/Context.
+if(ANDROID)
+    enable_language(ASM)
+    target_sources(rexcore PRIVATE
+        fiber_android_arm64.S
+        platform_android_jni.cpp
+    )
+endif()
+
 target_include_directories(rexcore PUBLIC
     $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
     $<BUILD_INTERFACE:${PROJECT_BINARY_DIR}/include>
@@ -75,7 +86,11 @@ target_include_directories(rexcore PRIVATE
     ${PROJECT_SOURCE_DIR}/thirdparty/cli11/include
 )
 
-if(UNIX)
+if(ANDROID)
+    # bionic folds pthread and rt into libc (no separate libpthread/librt).
+    # dl exists; log is the Android logging lib.
+    target_link_libraries(rexcore PRIVATE dl log)
+elseif(UNIX)
     target_link_libraries(rexcore PRIVATE pthread rt dl)
 endif()
 
