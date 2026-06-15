@@ -18,6 +18,12 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+# Tracy ships a shared client lib with desktop-oriented assumptions; disable it
+# for the initial Android bring-up to minimise build friction. Re-enable later
+# once the Android target is stable.
+if(ANDROID)
+    set(REXGLUE_ENABLE_TRACY OFF CACHE BOOL "" FORCE)
+endif()
 # Propagate profiling defines globally (compiled out in Release)
 if(REXGLUE_ENABLE_TRACY)
     add_compile_definitions($<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
@@ -120,6 +126,18 @@ if(WIN32)
         message(FATAL_ERROR "Unsupported Windows architecture: ${CMAKE_SYSTEM_PROCESSOR}")
     endif()
     add_compile_definitions(REX_PLATFORM_WINDOWS=1)
+elseif(ANDROID)
+    # Android is detected before the generic UNIX branch because the NDK
+    # toolchain also sets UNIX. ABI is arm64-v8a (see android-arm64 presets).
+    set(REX_PLATFORM "android-${CMAKE_ANDROID_ARCH_ABI}")
+    # REX_PLATFORM_ANDROID (and REX_PLATFORM_LINUX) are derived from __ANDROID__
+    # in include/rex/platform.h - keep the CMake define in sync for parity with
+    # the desktop branches that set it explicitly.
+    add_compile_definitions(REX_PLATFORM_LINUX=1)
+    # libc++ gates std::jthread / std::stop_token (used by core/timer_queue.cpp)
+    # behind the experimental library. Desktop libstdc++/MSVC have them by default.
+    add_compile_options(-fexperimental-library)
+    add_link_options(-fexperimental-library)
 elseif(UNIX AND NOT APPLE)
     if(CMAKE_SYSTEM_PROCESSOR MATCHES "AMD64|x86_64")
         set(REX_PLATFORM "linux-amd64")
@@ -130,7 +148,7 @@ elseif(UNIX AND NOT APPLE)
     endif()
     add_compile_definitions(REX_PLATFORM_LINUX=1)
 else()
-    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows and Linux only.")
+    message(FATAL_ERROR "Unsupported platform. ReXGlue supports Windows, Linux and Android.")
 endif()
 
 # Build config as compile definition (multi-config generators don't know config at configure time)

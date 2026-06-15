@@ -419,3 +419,7 @@ FodyWeavers.xsd
 
 # CMake User Overrides
 CMakeUserPresets.json
+
+# Local tooling (not for distribution)
+/.codegraph/
+/.cursor/

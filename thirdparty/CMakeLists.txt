@@ -236,7 +236,17 @@ set(SDL_TEST OFF CACHE BOOL "" FORCE)
 set(SDL_UNIX_CONSOLE_BUILD ON CACHE BOOL "" FORCE)
 
 # Disable unused subsystems
-set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+# NOTE(Android): SDL3's Android core (SDL_events.c / JNI glue) is compiled
+# unconditionally on Android and references the Android *video* backend
+# (Android_PumpEvents, Android_Window, ...). With SDL_VIDEO OFF that backend is
+# absent and the link fails, so video must stay ON for Android. The SDK uses its
+# own rex::ui window backend; SDL video is only present to satisfy SDL's internal
+# Android coupling (revisit in Phase 3 when finalising the input architecture).
+if(ANDROID)
+    set(SDL_VIDEO ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_VIDEO OFF CACHE BOOL "" FORCE)
+endif()
 set(SDL_RENDER OFF CACHE BOOL "" FORCE)
 set(SDL_HAPTIC OFF CACHE BOOL "" FORCE)
 set(SDL_SENSOR OFF CACHE BOOL "" FORCE)
@@ -251,7 +261,12 @@ set(SDL_CAMERA OFF CACHE BOOL "" FORCE)
 
 # Disable graphics APIs (unused without video)
 set(SDL_OPENGL OFF CACHE BOOL "" FORCE)
-set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+# Android's SDL video backend needs an EGL/GLES driver to build/link.
+if(ANDROID)
+    set(SDL_OPENGLES ON CACHE BOOL "" FORCE)
+else()
+    set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+endif()
 set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
 set(SDL_METAL OFF CACHE BOOL "" FORCE)
 
@@ -260,8 +275,12 @@ set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
 set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
 
-# Linux audio backends
-if(UNIX AND NOT APPLE)
+# Audio backends
+if(ANDROID)
+    # Android has no ALSA/PulseAudio/PipeWire. Use the NDK-native backends.
+    set(SDL_AAUDIO   ON  CACHE BOOL "" FORCE)
+    set(SDL_OPENSLES ON  CACHE BOOL "" FORCE)
+elseif(UNIX AND NOT APPLE)
     set(SDL_ALSA              ON  CACHE BOOL "" FORCE)
     set(SDL_ALSA_SHARED       ON  CACHE BOOL "" FORCE)
     set(SDL_PULSEAUDIO        ON  CACHE BOOL "" FORCE)
@@ -533,6 +552,12 @@ target_include_directories(libavutil
 )
 target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
+if(ANDROID)
+    # FFmpeg's aarch64 NEON asm addresses constant tables (ff_cos_*) with
+    # adrp/add direct addressing, which requires non-preemptible (hidden)
+    # symbols when linked into a PIC shared object (librexruntime.so).
+    target_compile_options(libavutil PRIVATE -fvisibility=hidden)
+endif()
 if(WIN32)
     target_link_libraries(libavutil PRIVATE bcrypt)
 endif()
@@ -662,6 +687,11 @@ target_include_directories(libavcodec
 )
 target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
 target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
+if(ANDROID)
+    # See libavutil note: hidden visibility so the NEON asm's adrp/add against
+    # ff_cos_* / table symbols stays DSO-local under PIC.
+    target_compile_options(libavcodec PRIVATE -fvisibility=hidden)
+endif()
 target_link_libraries(libavcodec PUBLIC libavutil)
 if(WIN32)
     target_link_libraries(libavcodec PRIVATE bcrypt)

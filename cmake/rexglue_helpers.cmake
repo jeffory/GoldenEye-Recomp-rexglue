@@ -14,7 +14,15 @@
 # runtime DLL staging is the host's job (see rexglue_configure_target).
 #==========================================================
 function(rexglue_apply_target_settings target_name)
-    if(UNIX AND NOT APPLE)
+    if(ANDROID)
+        # NativeActivity glue header (for android_main / android_app); no GTK.
+        target_include_directories(${target_name} PRIVATE
+            ${CMAKE_ANDROID_NDK}/sources/android/native_app_glue)
+        # libc++ gates std::jthread/stop_token behind the experimental library;
+        # the SDK's global flag doesn't propagate to a parent-project app target.
+        target_compile_options(${target_name} PRIVATE -march=armv8-a -fexperimental-library)
+        target_link_options(${target_name} PRIVATE -fexperimental-library)
+    elseif(UNIX AND NOT APPLE)
         find_package(PkgConfig REQUIRED)
         pkg_check_modules(GTK3 REQUIRED gtk+-3.0)
         target_include_directories(${target_name} PRIVATE ${GTK3_INCLUDE_DIRS})
@@ -51,6 +59,14 @@ function(rexglue_configure_target target_name)
     if(WIN32)
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_win.cpp)
+    elseif(ANDROID)
+        # NativeActivity entry (android_main) + the NDK app-glue translation unit
+        # (provides ANativeActivity_onCreate and the glue thread that calls it).
+        target_sources(${target_name} PRIVATE
+            ${REXGLUE_SHARE_DIR}/windowed_app_main_android.cpp
+            ${CMAKE_ANDROID_NDK}/sources/android/native_app_glue/android_native_app_glue.c)
+        # Keep ANativeActivity_onCreate exported even with --gc-sections.
+        target_link_options(${target_name} PRIVATE -u ANativeActivity_onCreate)
     else()
         target_sources(${target_name} PRIVATE
             ${REXGLUE_SHARE_DIR}/windowed_app_main_posix.cpp)
