@@ -32,10 +32,10 @@ u32 XAudioGetSpeakerConfig_entry(mapped_u32 config_ptr) {
 u32 XAudioGetVoiceCategoryVolumeChangeMask_entry(mapped_void driver_ptr, mapped_u32 out_ptr) {
   assert_true((driver_ptr.guest_address() & 0xFFFF0000) == 0x41550000);
 
-  rex::thread::Sleep(std::chrono::microseconds(1));
-
-  // Checking these bits to see if any voice volume changed.
-  // I think.
+  // No volume-change tracking is implemented, so report "nothing changed".
+  // This previously slept 1us before returning; on Android a 1us sleep rounds
+  // up to a scheduler tick and forces a context switch, and games poll this per
+  // frame, injecting a reschedule straight into the frame path. Return at once.
   *out_ptr = 0;
   return X_ERROR_SUCCESS;
 }
