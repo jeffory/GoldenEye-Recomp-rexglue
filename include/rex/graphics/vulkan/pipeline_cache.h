@@ -371,6 +371,27 @@ class VulkanPipelineCache {
   void CreateQueuedPipelinesOnProcessorThread();
   void ProcessDeferredPipelineDestructions(bool force_all);
 
+  // Persistent host pipeline cache (VkPipelineCache). Seeded from disk during
+  // InitializeShaderStorage and written back on storage switch / shutdown so
+  // native shader compilation results survive across launches. This is the
+  // single biggest win on tiled mobile GPUs where a desktop 1-3ms compile turns
+  // into a 10-50ms hitch. Passed to every vkCreate*Pipelines call.
+  //
+  // (Re)creates pipeline_disk_cache_, destroying any previous handle. initial_data
+  // may be null for an empty cache, or a previously persisted blob to seed from.
+  bool CreatePipelineDiskCacheHandle(const void* initial_data, size_t initial_data_size);
+  // Validates a persisted blob's header against the current device and returns
+  // true if it is safe to seed a VkPipelineCache from it.
+  bool IsPipelineDiskCacheBlobUsable(const std::vector<uint8_t>& blob) const;
+  // Reads pipeline_disk_cache_path_ and seeds pipeline_disk_cache_ from it when
+  // the header matches the current device; otherwise leaves the cache empty.
+  void SeedPipelineDiskCacheFromDisk();
+  // Writes the current VkPipelineCache contents back to pipeline_disk_cache_path_.
+  void StorePipelineDiskCache();
+
+  VkPipelineCache pipeline_disk_cache_ = VK_NULL_HANDLE;
+  std::filesystem::path pipeline_disk_cache_path_;
+
   VulkanCommandProcessor& command_processor_;
   const RegisterFile& register_file_;
   VulkanRenderTargetCache& render_target_cache_;

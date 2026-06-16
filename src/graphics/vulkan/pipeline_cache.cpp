@@ -59,6 +59,13 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",
                     "Render tessellation as wireframe")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+REXCVAR_DEFINE_BOOL(
+    vulkan_persistent_pipeline_cache, true, "GPU/Vulkan",
+    "Seed a persistent VkPipelineCache from disk and write it back on shutdown so native "
+    "shader compilation results survive across launches (greatly reduces first-encounter "
+    "compile hitches on tiled mobile GPUs)")
+    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+
 namespace rex::graphics::vulkan {
 
 namespace {
@@ -285,6 +292,123 @@ VulkanPipelineCache::~VulkanPipelineCache() {
   Shutdown();
 }
 
+bool VulkanPipelineCache::CreatePipelineDiskCacheHandle(const void* initial_data,
+                                                        size_t initial_data_size) {
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  if (pipeline_disk_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, pipeline_disk_cache_, nullptr);
+    pipeline_disk_cache_ = VK_NULL_HANDLE;
+  }
+  VkPipelineCacheCreateInfo create_info;
+  create_info.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  create_info.pNext = nullptr;
+  create_info.flags = 0;
+  create_info.initialDataSize = initial_data_size;
+  create_info.pInitialData = initial_data_size ? initial_data : nullptr;
+  VkResult result =
+      dfn.vkCreatePipelineCache(device, &create_info, nullptr, &pipeline_disk_cache_);
+  if (result != VK_SUCCESS) {
+    pipeline_disk_cache_ = VK_NULL_HANDLE;
+    REXGPU_WARN(
+        "VulkanPipelineCache: vkCreatePipelineCache failed (result={}); native shader "
+        "compilation results will not be reused this run",
+        int32_t(result));
+    return false;
+  }
+  return true;
+}
+
+bool VulkanPipelineCache::IsPipelineDiskCacheBlobUsable(const std::vector<uint8_t>& blob) const {
+  // VkPipelineCacheHeaderVersionOne layout (Vulkan 1.0+), parsed manually so the
+  // validation does not depend on a specific Vulkan header revision. The driver
+  // also rejects a mismatched blob passed as pInitialData, but validating here
+  // keeps stale per-device caches from being kept around and re-saved.
+  struct CacheBlobHeader {
+    uint32_t header_length;
+    uint32_t header_version;
+    uint32_t vendor_id;
+    uint32_t device_id;
+    uint8_t cache_uuid[VK_UUID_SIZE];
+  };
+  if (blob.size() < sizeof(CacheBlobHeader)) {
+    return false;
+  }
+  CacheBlobHeader header;
+  std::memcpy(&header, blob.data(), sizeof(header));
+  if (header.header_length < sizeof(CacheBlobHeader) || header.header_length > blob.size()) {
+    return false;
+  }
+  if (header.header_version != VK_PIPELINE_CACHE_HEADER_VERSION_ONE) {
+    return false;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  VkPhysicalDeviceProperties physical_device_properties;
+  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceProperties(
+      vulkan_device->physical_device(), &physical_device_properties);
+  return header.vendor_id == physical_device_properties.vendorID &&
+         header.device_id == physical_device_properties.deviceID &&
+         std::memcmp(header.cache_uuid, physical_device_properties.pipelineCacheUUID,
+                     VK_UUID_SIZE) == 0;
+}
+
+void VulkanPipelineCache::SeedPipelineDiskCacheFromDisk() {
+  std::vector<uint8_t> blob;
+  if (FILE* file = rex::filesystem::OpenFile(pipeline_disk_cache_path_, "rb")) {
+    if (rex::filesystem::Seek(file, 0, SEEK_END)) {
+      int64_t size = rex::filesystem::Tell(file);
+      if (size > 0 && rex::filesystem::Seek(file, 0, SEEK_SET)) {
+        blob.resize(size_t(size));
+        blob.resize(fread(blob.data(), 1, blob.size(), file));
+      }
+    }
+    fclose(file);
+  }
+  if (!blob.empty() && IsPipelineDiskCacheBlobUsable(blob) &&
+      CreatePipelineDiskCacheHandle(blob.data(), blob.size())) {
+    REXGPU_INFO("VulkanPipelineCache: Seeded persistent VkPipelineCache from {} ({} bytes)",
+                rex::path_to_utf8(pipeline_disk_cache_path_), blob.size());
+    return;
+  }
+  // No usable prior cache - make sure an empty one exists so this run still
+  // accumulates compiled pipelines to persist on exit.
+  if (pipeline_disk_cache_ == VK_NULL_HANDLE) {
+    CreatePipelineDiskCacheHandle(nullptr, 0);
+  }
+}
+
+void VulkanPipelineCache::StorePipelineDiskCache() {
+  if (pipeline_disk_cache_ == VK_NULL_HANDLE || pipeline_disk_cache_path_.empty()) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  const VkDevice device = vulkan_device->device();
+  size_t data_size = 0;
+  if (dfn.vkGetPipelineCacheData(device, pipeline_disk_cache_, &data_size, nullptr) != VK_SUCCESS ||
+      !data_size) {
+    return;
+  }
+  std::vector<uint8_t> data(data_size);
+  VkResult result =
+      dfn.vkGetPipelineCacheData(device, pipeline_disk_cache_, &data_size, data.data());
+  // VK_INCOMPLETE can happen if the cache grew between the two calls; the partial
+  // data is still a valid, seedable blob, so accept it.
+  if (result != VK_SUCCESS && result != VK_INCOMPLETE) {
+    return;
+  }
+  data.resize(data_size);
+  FILE* file = rex::filesystem::OpenFile(pipeline_disk_cache_path_, "wb");
+  if (!file) {
+    REXGPU_WARN("VulkanPipelineCache: Failed to open {} for writing the persistent pipeline cache",
+                rex::path_to_utf8(pipeline_disk_cache_path_));
+    return;
+  }
+  fwrite(data.data(), 1, data.size(), file);
+  fclose(file);
+}
+
 bool VulkanPipelineCache::Initialize() {
   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
 
@@ -385,6 +509,13 @@ bool VulkanPipelineCache::Initialize() {
     }
   }
 
+  // Create an (initially empty) persistent pipeline cache so every
+  // vkCreate*Pipelines call has one even before shader storage is opened.
+  // InitializeShaderStorage re-seeds it from disk when a cache root is known.
+  if (REXCVAR_GET(vulkan_persistent_pipeline_cache)) {
+    CreatePipelineDiskCacheHandle(nullptr, 0);
+  }
+
   return true;
 }
 
@@ -410,6 +541,19 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
 
   bool edram_fragment_shader_interlock =
       render_target_cache_.GetPath() == RenderTargetCache::Path::kPixelShaderInterlock;
+
+  // Seed the persistent VkPipelineCache from disk before recreating the stored
+  // pipelines below, so the bulk creation pass already benefits from it. The
+  // file is keyed by title and the device identity (driver updates change the
+  // pipeline cache UUID, which is also validated on load).
+  if (REXCVAR_GET(vulkan_persistent_pipeline_cache)) {
+    const auto& device_properties = command_processor_.GetVulkanDevice()->properties();
+    pipeline_disk_cache_path_ =
+        shader_storage_shareable_root /
+        fmt::format("{:08X}.{:08X}_{:08X}_{:08X}.vk.pcache", title_id, device_properties.vendorID,
+                    device_properties.deviceID, device_properties.driverVersion);
+    SeedPipelineDiskCacheFromDisk();
+  }
 
   // Initialize the pipeline storage stream - read pipeline descriptions and
   // collect used shader modifications to translate.
@@ -739,6 +883,13 @@ void VulkanPipelineCache::ShutdownShaderStorage() {
     shader_storage_file_flush_needed_ = false;
   }
 
+  // Persist the pipeline cache accumulated for this storage. vkGetPipelineCacheData
+  // and vkCreate*Pipelines on the same VkPipelineCache are internally synchronized
+  // by the implementation, so this is safe even if creation threads are still live
+  // on a storage switch. The handle itself stays alive and is destroyed in Shutdown().
+  StorePipelineDiskCache();
+  pipeline_disk_cache_path_.clear();
+
   shader_storage_cache_root_.clear();
   shader_storage_title_id_ = 0;
 }
@@ -833,6 +984,13 @@ void VulkanPipelineCache::Shutdown() {
     }
   }
   pipelines_.clear();
+
+  // The persistent pipeline cache was already written back by ShutdownShaderStorage
+  // (called above); just release the handle now.
+  if (pipeline_disk_cache_ != VK_NULL_HANDLE) {
+    dfn.vkDestroyPipelineCache(device, pipeline_disk_cache_, nullptr);
+    pipeline_disk_cache_ = VK_NULL_HANDLE;
+  }
 
   // Destroy all internal shaders.
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyShaderModule, device,
@@ -1111,8 +1269,18 @@ bool VulkanPipelineCache::ConfigurePipeline(
     }
   }
 
-  bool use_async = REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty() &&
-                   pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+  bool async_compilation_enabled =
+      REXCVAR_GET(async_shader_compilation) && !creation_threads_.empty();
+  // Color draws hot-swap a placeholder pixel shader so the screen isn't black
+  // while the real pipeline compiles.
+  bool use_async_placeholder =
+      async_compilation_enabled && pixel_shader && placeholder_pixel_shader_ != VK_NULL_HANDLE;
+  // Depth-only / no-pixel-shader draws (Z-prepass, shadows) have no color output
+  // to fake, so instead of blocking on a synchronous create we queue the real
+  // pipeline and skip the draw until it is ready (a brief, depth-only skip rather
+  // than a multi-millisecond hitch on the draw thread).
+  bool use_async_skip = async_compilation_enabled && !pixel_shader;
+  bool use_async = use_async_placeholder || use_async_skip;
   uint8_t async_priority = pipeline_util::kPriorityLowest;
   if (use_async) {
     uint32_t bound_rts =
@@ -1128,7 +1296,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
   auto it = pipelines_.find(description);
   if (it != pipelines_.end()) {
     VkPipeline found_pipeline = it->second.pipeline.load(std::memory_order_acquire);
-    if (found_pipeline == VK_NULL_HANDLE) {
+    bool found_is_placeholder = it->second.is_placeholder.load(std::memory_order_acquire);
+    // Only force a synchronous create when nothing is in flight. If a placeholder
+    // (color) or skip-until-ready (depth-only) async creation is pending, let it
+    // finish off-thread instead of blocking the draw thread here.
+    if (found_pipeline == VK_NULL_HANDLE && !found_is_placeholder) {
       PipelineCreationArguments creation_arguments;
       if (!TryGetPipelineCreationArgumentsForDescription(description, &*it, creation_arguments) ||
           !EnsurePipelineCreated(creation_arguments)) {
@@ -1144,6 +1316,11 @@ bool VulkanPipelineCache::ConfigurePipeline(
     if (pipeline_handle_out) {
       *pipeline_handle_out = &it->second;
     }
+    // A pending async placeholder/skip is reported as success; the command
+    // processor observes is_placeholder via the handle and skips the draw.
+    if (it->second.is_placeholder.load(std::memory_order_acquire)) {
+      return true;
+    }
     return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
   }
 
@@ -1157,7 +1334,7 @@ bool VulkanPipelineCache::ConfigurePipeline(
   }
 
   bool queued_async_creation = false;
-  if (use_async) {
+  if (use_async_placeholder) {
     creation_arguments_real.priority = async_priority;
     PipelineCreationArguments creation_arguments_placeholder;
     if (TryGetPipelineCreationArgumentsForDescription(description, &pipeline,
@@ -1174,6 +1351,19 @@ bool VulkanPipelineCache::ConfigurePipeline(
         pipeline.second.is_placeholder.store(false, std::memory_order_release);
       }
     }
+  } else if (use_async_skip) {
+    // No placeholder pipeline to fall back to - mark as a placeholder so the draw
+    // is skipped until the real depth-only pipeline finishes compiling off-thread.
+    // If creation fails, the creation thread clears is_placeholder so the draw
+    // stops being skipped.
+    creation_arguments_real.priority = async_priority;
+    pipeline.second.is_placeholder.store(true, std::memory_order_release);
+    {
+      std::lock_guard<std::mutex> lock(creation_request_lock_);
+      creation_queue_.push(creation_arguments_real);
+    }
+    creation_request_cond_.notify_one();
+    queued_async_creation = true;
   }
 
   if (!queued_async_creation && !EnsurePipelineCreated(creation_arguments_real)) {
@@ -1201,6 +1391,12 @@ bool VulkanPipelineCache::ConfigurePipeline(
   pipeline_layout_out = pipeline.second.pipeline_layout.load(std::memory_order_acquire);
   if (pipeline_handle_out) {
     *pipeline_handle_out = &pipeline.second;
+  }
+  // Async placeholder (color) or skip-until-ready (depth-only) creation in flight:
+  // report success even though pipeline_out may still be VK_NULL_HANDLE; the
+  // command processor skips the draw via the is_placeholder flag on the handle.
+  if (pipeline.second.is_placeholder.load(std::memory_order_acquire)) {
+    return true;
   }
   return pipeline_out != VK_NULL_HANDLE && pipeline_layout_out != nullptr;
 }
@@ -3023,13 +3219,15 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   // unsupported behavior that may be dangerous/crashing because pipelines can
   // be created from the disk storage.
 
+  // DEBUG, not INFO: the bulk load and first-encounter creation emit thousands of
+  // these, which floods the log and itself costs time on the load path.
   if (creation_arguments.pixel_shader) {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash(),
-                creation_arguments.pixel_shader->shader().ucode_data_hash());
+    REXGPU_DEBUG("Creating graphics pipeline state with VS {:016X}, PS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash(),
+                 creation_arguments.pixel_shader->shader().ucode_data_hash());
   } else {
-    REXGPU_INFO("Creating graphics pipeline state with VS {:016X}",
-                creation_arguments.vertex_shader->shader().ucode_data_hash());
+    REXGPU_DEBUG("Creating graphics pipeline state with VS {:016X}",
+                 creation_arguments.vertex_shader->shader().ucode_data_hash());
   }
 
   const PipelineDescription& description = creation_arguments.pipeline->first;
@@ -3480,8 +3678,8 @@ bool VulkanPipelineCache::EnsurePipelineCreated(const PipelineCreationArguments&
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
   VkPipeline pipeline;
-  VkResult create_result = dfn.vkCreateGraphicsPipelines(device, VK_NULL_HANDLE, 1,
-                                                         &pipeline_create_info, nullptr, &pipeline);
+  VkResult create_result = dfn.vkCreateGraphicsPipelines(
+      device, pipeline_disk_cache_, 1, &pipeline_create_info, nullptr, &pipeline);
   if (create_result != VK_SUCCESS) {
     uint64_t ps_hash = creation_arguments.pixel_shader
                            ? creation_arguments.pixel_shader->shader().ucode_data_hash()
@@ -3548,8 +3746,13 @@ void VulkanPipelineCache::CreationThread(size_t thread_index) {
         // Keep the placeholder resident and stop waiting for a real pipeline.
         creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       } else {
+        // No usable pipeline (includes a failed depth-only skip whose placeholder
+        // flag was set without a fallback pipeline): clear both so the draw stops
+        // being skipped and falls through to the normal failure path instead.
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        creation_arguments.pipeline->second.is_placeholder.store(false,
+                                                                 std::memory_order_release);
       }
     }
 
@@ -3581,8 +3784,13 @@ void VulkanPipelineCache::CreateQueuedPipelinesOnProcessorThread() {
       if (has_placeholder && pipeline != VK_NULL_HANDLE) {
         creation_arguments.pipeline->second.is_placeholder.store(false, std::memory_order_release);
       } else {
+        // No usable pipeline (includes a failed depth-only skip whose placeholder
+        // flag was set without a fallback pipeline): clear both so the draw stops
+        // being skipped and falls through to the normal failure path instead.
         creation_arguments.pipeline->second.pipeline.store(VK_NULL_HANDLE,
                                                            std::memory_order_release);
+        creation_arguments.pipeline->second.is_placeholder.store(false,
+                                                                 std::memory_order_release);
       }
     }
   }
