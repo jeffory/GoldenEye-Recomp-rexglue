@@ -25,6 +25,10 @@ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller 
 REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
 REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
     .range(0.01, 10.0);
+REXCVAR_DEFINE_DOUBLE(mnk_sensitivity_y, 0.0, "Input",
+                      "Separate vertical mouse sensitivity (0 = use mnk_sensitivity)")
+    .range(0.0, 10.0);
+REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert vertical mouse-look");
 
 REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
@@ -194,9 +198,13 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
     ly -= INT16_MAX;
 
   double sensitivity = REXCVAR_GET(mnk_sensitivity);
+  double sensitivity_y_cv = REXCVAR_GET(mnk_sensitivity_y);
+  double sensitivity_y = sensitivity_y_cv > 0.0 ? sensitivity_y_cv : sensitivity;
+  // Screen-space mouse Y is down-positive, so a non-inverted look negates dy.
+  double y_sign = REXCVAR_GET(mnk_invert_y) ? 1.0 : -1.0;
   constexpr double kBaseScale = 200.0;
   int32_t rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
-  int32_t ry = static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+  int32_t ry = static_cast<int32_t>(y_sign * mouse_dy_ * sensitivity_y * kBaseScale);
   mouse_dx_ = 0;
   mouse_dy_ = 0;
 
