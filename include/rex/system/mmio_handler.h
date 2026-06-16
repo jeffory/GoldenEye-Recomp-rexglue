@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -80,6 +81,17 @@ class MMIOHandler {
   uint8_t* memory_end_;
 
   std::vector<MMIORange> mapped_ranges_;
+
+  // O(1) fast-reject gate for CheckLoad/CheckStore. Inclusive bounds covering
+  // every guest address that could possibly match a registered MMIO range: an
+  // address matches range r only if (addr & r.mask) == r.address, i.e. only if
+  // it lies within [r.address, r.address | ~r.mask]. The global min/max over
+  // all ranges therefore bound every potential MMIO hit, so any address outside
+  // [min, max] cannot be MMIO and skips the linear scan with a single compare —
+  // the overwhelmingly common case (normal RAM). The sentinel (min > max) when
+  // no ranges are registered rejects everything, matching the empty-vector scan.
+  uint32_t mmio_address_min_ = UINT32_MAX;
+  uint32_t mmio_address_max_ = 0;
 
   HostToGuestVirtual host_to_guest_virtual_;
   const void* host_to_guest_virtual_context_;

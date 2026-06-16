@@ -91,6 +91,10 @@ bool MMIOHandler::RegisterRange(uint32_t virtual_address, uint32_t mask, uint32_
       read_callback,
       write_callback,
   });
+  // Widen the O(1) fast-reject gate to cover this range. An address can only
+  // match this range if it lies within [virtual_address, virtual_address | ~mask].
+  mmio_address_min_ = std::min(mmio_address_min_, virtual_address);
+  mmio_address_max_ = std::max(mmio_address_max_, virtual_address | ~mask);
   return true;
 }
 
@@ -104,6 +108,11 @@ MMIORange* MMIOHandler::LookupRange(uint32_t virtual_address) {
 }
 
 bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
+  // Fast reject: addresses outside the registered MMIO window (i.e. normal RAM,
+  // the common case) can never match, so skip the linear scan entirely.
+  if (virtual_address < mmio_address_min_ || virtual_address > mmio_address_max_) {
+    return false;
+  }
   for (const auto& range : mapped_ranges_) {
     if ((virtual_address & range.mask) == range.address) {
       *out_value =
@@ -115,6 +124,11 @@ bool MMIOHandler::CheckLoad(uint32_t virtual_address, uint32_t* out_value) {
 }
 
 bool MMIOHandler::CheckStore(uint32_t virtual_address, uint32_t value) {
+  // Fast reject: addresses outside the registered MMIO window (i.e. normal RAM,
+  // the common case) can never match, so skip the linear scan entirely.
+  if (virtual_address < mmio_address_min_ || virtual_address > mmio_address_max_) {
+    return false;
+  }
   for (const auto& range : mapped_ranges_) {
     if ((virtual_address & range.mask) == range.address) {
       range.write(nullptr, range.callback_context, virtual_address, value);
