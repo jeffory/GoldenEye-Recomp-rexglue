@@ -837,6 +837,32 @@ u32 NtCancelTimer_entry(u32 timer_handle, mapped_u32 current_state_ptr) {
   return result;
 }
 
+// True when GoldenEye's audio render callback is currently requesting a frame from
+// the producer thread (sub_82366628). The guest audio-object pointer is stored at
+// guest 0x8308EC34 (big-endian) and the per-frame request token lives at AO+300;
+// the callback sets it non-zero just before signalling the producer's wake event
+// (0x8308EC24) and clears it again after the frame. Used by the audio-producer
+// self-heal below to tell a real pending request from an idle spurious timeout.
+static bool GeAudioRequestPending() {
+  auto* mem = REX_KERNEL_MEMORY();
+  if (!mem) {
+    return false;
+  }
+  auto* ao_pp = mem->TranslateVirtual<const uint32_t*>(0x8308EC34u);
+  if (!ao_pp) {
+    return false;
+  }
+  uint32_t ao = __builtin_bswap32(*ao_pp);
+  if (!ao) {
+    return false;
+  }
+  auto* token = mem->TranslateVirtual<const uint32_t*>(ao + 300u);
+  if (!token) {
+    return false;
+  }
+  return __builtin_bswap32(*token) != 0u;
+}
+
 uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_t processor_mode,
                                  uint32_t alertable, uint64_t* timeout_ptr) {
   auto object = XObject::GetNativeObject<XObject>(REX_KERNEL_STATE(), object_ptr);
@@ -847,43 +873,55 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
     return X_STATUS_ABANDONED_WAIT_0;
   }
 
-  // GoldenEye lost-wakeup deadlock guard. Several GoldenEye worker threads use a
-  // lock-free hand-off that was written for the 360's single-core model (a thread
-  // and the interrupt/producer that wakes it interleave on ONE core); under
-  // emulation they run truly in parallel on separate host cores, so a wakeup can
-  // be lost and the worker is left on an INFINITE wait -> it never resumes its
-  // loop, and the subsystem it drives stalls while everything else keeps running.
-  // Each such worker is a wait-at-top-of-loop that re-checks its state and
-  // re-drives the pipeline on wakeup, so a spurious timeout is harmless: we never
-  // let these wait forever, turning an infinite wait into a short timeout so any
-  // lost wakeup self-heals. Affects only these specific worker threads.
-  //   - sub_821A4A68: deferred GPU command workers (ring drains -> screen freeze).
-  //   - sub_82366628: the audio client worker. It waits on the per-frame audio
-  //     event 0x8308EC24; when its first wakeup is lost at boot it blocks forever,
-  //     and because the boot init gates on the audio subsystem coming up, the
-  //     WHOLE boot stalls before the first frame (intermittent ~50% black boot).
-  //     Diagnosed via the infinite-wait tracer: a single stuck KeWaitForSingleObject
-  //     on 0x8308EC24, gstart=0x82366628, identical on every black boot.
-  //
-  // The true root cause is a guest-algorithm race (the producer decides not to
-  // KeSetEvent because the 360 model assumed the consumer could not yet be
-  // waiting); the host event itself is signalled correctly whenever the guest
-  // *does* call KeSetEvent, so there is no host-side wakeup to recover and the
-  // guest hand-off lives in recompiled PPC outside this layer. We therefore keep
-  // the self-heal poll but cap it BELOW one 60Hz frame (was 30ms ~= 2 frames):
-  // in the common case the event is signalled every frame and the wait returns
-  // on signal long before the cap fires, so this costs nothing; only when a
-  // wakeup is genuinely lost does it fire, and then it recovers in under a frame
-  // instead of stalling for two. arm64 cost is negligible: at most these two
-  // threads re-check at ~12ms, and only while actually stuck.
+  // GoldenEye lost-wakeup deadlock guard. GoldenEye worker threads use a lock-free
+  // hand-off written for the 360's single-core model (a thread and the
+  // interrupt/producer that wakes it interleave on ONE core); under emulation they
+  // run truly in parallel on separate host cores, so a wakeup can be lost and the
+  // worker is left on an INFINITE wait -> it never resumes its loop and the
+  // subsystem it drives stalls while everything else keeps running. We turn the
+  // affected threads' infinite waits into a poll just under one 60Hz frame so a lost
+  // wakeup self-heals; in the common case the event is signalled long before the cap
+  // fires, so it costs nothing.
   static constexpr int64_t kLostWakeupSelfHealTimeout = -120000;  // -12ms (NT 100ns units)
+
+  auto* gthread = XThread::GetCurrentThread();
+  uint32_t gstart = gthread ? gthread->creation_params()->start_address : 0u;
+
+  // Deferred GPU command worker (sub_821A4A68): a wait-at-top-of-loop that re-drives
+  // its pipeline on any wakeup, so a spurious timeout is harmless -> plain cap. If
+  // lost, the GPU ring drains and the screen freezes.
   uint64_t capped_timeout;
-  if (!timeout_ptr) {
-    auto* cur = XThread::GetCurrentThread();
-    uint32_t start = cur ? cur->creation_params()->start_address : 0u;
-    if (start == 0x821A4A68u || start == 0x82366628u) {
-      capped_timeout = static_cast<uint64_t>(kLostWakeupSelfHealTimeout);
-      timeout_ptr = &capped_timeout;
+  if (!timeout_ptr && gstart == 0x821A4A68u) {
+    capped_timeout = static_cast<uint64_t>(kLostWakeupSelfHealTimeout);
+    timeout_ptr = &capped_timeout;
+  }
+
+  // Audio producer (sub_82366628): a plain cap is NOT safe. Its loop TERMINATES the
+  // thread when it wakes and finds its request token AO[300]==0 (the consumer sets
+  // AO[300]!=0 only briefly around each frame), so a spurious idle timeout exits the
+  // producer and kills audio for good. On hosts where the wakeup is reliably
+  // delivered an infinite wait works, but where it is lost (observed on Android) the
+  // producer hangs and, because boot gates on the audio subsystem coming up, the
+  // screen goes black right after the intro. So poll on the same short timeout but
+  // only surface a timeout-wake to the guest when a frame is actually being requested
+  // (AO[300]!=0); suppress idle spurious wakes so the producer never sees a bogus
+  // wake. A genuinely lost wakeup leaves AO[300]!=0 and self-heals within one poll.
+  // Real signals/APCs are always surfaced (including the legitimate shutdown signal
+  // that sets AO[300]==0 and lets the producer exit cleanly).
+  if (!timeout_ptr && gstart == 0x82366628u) {
+    uint64_t poll_timeout = static_cast<uint64_t>(kLostWakeupSelfHealTimeout);
+    for (;;) {
+      X_STATUS r = object->Wait(wait_reason, processor_mode, alertable, &poll_timeout);
+      if (r != X_STATUS_TIMEOUT) {
+        if (alertable && r == X_STATUS_USER_APC) {
+          XThread::GetCurrentThread()->DeliverAPCs();
+        }
+        return r;
+      }
+      if (GeAudioRequestPending()) {
+        return r;  // real request pending: let the producer run (recovers lost wakeup)
+      }
+      // Idle spurious timeout: keep waiting, don't wake the guest.
     }
   }
 
@@ -899,14 +937,8 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
 u32 KeWaitForSingleObject_entry(mapped_void object_ptr, u32 wait_reason, u32 processor_mode,
                                 u32 alertable, mapped_u64 timeout_ptr) {
   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
-  // REXKRNL_IMPORT_TRACE("KeWaitForSingleObject", "obj={:#x} reason={} mode={} alertable={}
-  // timeout={}",
-  // object_ptr.guest_address(), (uint32_t)wait_reason,
-  //(uint32_t)processor_mode, (uint32_t)alertable,
-  // timeout_ptr ? (int64_t)timeout : -1);
   auto result = xeKeWaitForSingleObject(object_ptr, wait_reason, processor_mode, alertable,
                                         timeout_ptr ? &timeout : nullptr);
-  // REXKRNL_IMPORT_RESULT("KeWaitForSingleObject", "{:#x}", result);
   return result;
 }
 
