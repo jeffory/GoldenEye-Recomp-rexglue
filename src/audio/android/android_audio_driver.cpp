@@ -241,7 +241,9 @@ void AndroidAudioDriver::StartFallbackPacer() {
       for (long c = 1; c < ncpu; ++c) {
         CPU_SET(c, &cpus);
       }
-      pthread_setaffinity_np(pthread_self(), sizeof(cpus), &cpus);
+      // bionic has no pthread_setaffinity_np; sched_setaffinity(0, ...) targets
+      // the calling thread.
+      sched_setaffinity(0, sizeof(cpus), &cpus);
     }
 
     const auto period = std::chrono::microseconds(
