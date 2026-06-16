@@ -41,6 +41,11 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
                       "Vulkan render target implementation path")
     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
 
+REXCVAR_DEFINE_BOOL(vulkan_edram_roundtrip_stats, false, "GPU/Vulkan",
+                    "Log per-frame EDRAM render-target transfer/resolve round-trip counts from the "
+                    "host-render-targets path. Useful for measuring the tiler-killer overhead on "
+                    "arm64/tiled GPUs before/after a change (HOM-149).");
+
 // DEFINE_string(
 //     render_target_path_vulkan, "",
 //     "Render target emulation path to use on Vulkan.\n"
@@ -93,6 +98,53 @@ namespace shaders {
 #include "../shaders/vulkan_spirv/resolve_full_8bpp_cs.h"
 #include "../shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h"
 }  // namespace shaders
+
+namespace {
+
+// Per-frame instrumentation for EDRAM render-target transfer/resolve round-trips
+// on the host-render-targets path. These round-trips (transfer render passes and
+// host-depth-store compute dispatches) force a tiled GPU to spill on-chip tile
+// memory to system memory and reload it, which is the dominant arm64 stutter
+// source GoldenEye triggers by re-pointing EDRAM regions constantly. The counter
+// flushes once per submission (frame) so the cost can be measured before/after a
+// change; gated behind the vulkan_edram_roundtrip_stats cvar, zero overhead when
+// disabled.
+struct EdramRoundtripStats {
+  uint64_t submission = UINT64_MAX;
+  uint32_t transfer_render_passes = 0;
+  uint32_t transfer_draws = 0;
+  uint32_t host_depth_store_dispatches = 0;
+  uint32_t perform_calls = 0;
+  uint32_t skipped_noop_calls = 0;
+
+  // Call at the start of every reconfiguration (both real and skipped no-ops).
+  // Flushes and resets when the submission index advances.
+  void BeginReconfiguration(uint64_t current_submission) {
+    if (!REXCVAR_GET(vulkan_edram_roundtrip_stats)) {
+      return;
+    }
+    if (current_submission != submission) {
+      if (submission != UINT64_MAX &&
+          (transfer_render_passes || host_depth_store_dispatches || skipped_noop_calls)) {
+        REXGPU_INFO(
+            "EDRAM round-trips frame {}: {} transfer passes, {} transfer draws, {} host-depth "
+            "stores across {} reconfigs ({} skipped as no-op)",
+            submission, transfer_render_passes, transfer_draws, host_depth_store_dispatches,
+            perform_calls, skipped_noop_calls);
+      }
+      submission = current_submission;
+      transfer_render_passes = 0;
+      transfer_draws = 0;
+      host_depth_store_dispatches = 0;
+      perform_calls = 0;
+      skipped_noop_calls = 0;
+    }
+  }
+};
+
+EdramRoundtripStats g_edram_roundtrip_stats;
+
+}  // namespace
 
 const VulkanRenderTargetCache::ResolveCopyShaderCode
     VulkanRenderTargetCache::kResolveCopyShaders[size_t(
@@ -1601,8 +1653,27 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
       RenderTarget* const* depth_and_color_render_targets =
           last_update_accumulated_render_targets();
 
-      PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
-                                       depth_and_color_render_targets, last_update_transfers());
+      // PerformTransfersAndResolveClears with no resolve clear is a no-op when
+      // every accumulated transfer list is empty (each of its loops early-outs
+      // on empty transfers). GoldenEye re-points EDRAM constantly, so most
+      // reconfigurations carry no transfers - skipping the call entirely here
+      // avoids the redundant per-update barrier/host-depth-store scans without
+      // changing any emitted GPU work. The behavior is identical to calling it.
+      const std::vector<Transfer>* update_transfers = last_update_transfers();
+      bool any_transfers = false;
+      for (uint32_t i = 0; i < 1 + xenos::kMaxColorRenderTargets; ++i) {
+        if (!update_transfers[i].empty()) {
+          any_transfers = true;
+          break;
+        }
+      }
+      if (any_transfers) {
+        PerformTransfersAndResolveClears(1 + xenos::kMaxColorRenderTargets,
+                                         depth_and_color_render_targets, update_transfers);
+      } else {
+        g_edram_roundtrip_stats.BeginReconfiguration(command_processor_.GetCurrentSubmission());
+        ++g_edram_roundtrip_stats.skipped_noop_calls;
+      }
 
       if (depth_and_color_render_targets[0]) {
         render_pass_key.depth_and_color_used |= 1 << 0;
@@ -4761,6 +4832,9 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
   uint64_t current_submission = command_processor_.GetCurrentSubmission();
   DeferredCommandBuffer& command_buffer = command_processor_.deferred_command_buffer();
 
+  g_edram_roundtrip_stats.BeginReconfiguration(current_submission);
+  ++g_edram_roundtrip_stats.perform_calls;
+
   bool resolve_clear_needed = render_target_resolve_clear_values && resolve_clear_rectangle;
   VkClearRect resolve_clear_rect;
   if (resolve_clear_needed) {
@@ -4854,6 +4928,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
             sizeof(host_depth_store_rectangle_constant), &host_depth_store_rectangle_constant);
         command_processor_.SubmitBarriers(true);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y, 1);
+        ++g_edram_roundtrip_stats.host_depth_store_dispatches;
         MarkEdramBufferModified();
       }
     }
@@ -5170,6 +5245,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
 
       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+      ++g_edram_roundtrip_stats.transfer_render_passes;
 
       if (stencil_clear_rectangle_count) {
         VkClearAttachment* stencil_clear_attachment;
@@ -5474,6 +5550,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
                                                       transfer_stencil_bit);
             }
             command_buffer.CmdVkDraw(transfer_vertex_count, 1, 0, 0);
+            ++g_edram_roundtrip_stats.transfer_draws;
           }
         }
       }
@@ -5483,6 +5560,7 @@ void VulkanRenderTargetCache::PerformTransfersAndResolveClears(
     if (resolve_clear_needed) {
       command_processor_.SubmitBarriersAndEnterRenderTargetCacheRenderPass(
           transfer_render_pass, transfer_framebuffer, transfer_dest_view, dest_rt_key.is_depth);
+      ++g_edram_roundtrip_stats.transfer_render_passes;
       VkClearAttachment resolve_clear_attachment;
       resolve_clear_attachment.colorAttachment = 0;
       std::memset(&resolve_clear_attachment.clearValue, 0,

@@ -23,6 +23,8 @@ if(ANDROID)
         android/android_audio_system.cpp
         android/android_audio_driver.cpp
     )
+    # Real low-latency output uses AAudio (NDK API 26+; build targets android-29).
+    target_link_libraries(rexaudio PRIVATE aaudio)
 endif()
 
 target_include_directories(rexaudio PUBLIC

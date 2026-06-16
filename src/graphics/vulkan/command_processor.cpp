@@ -28,6 +28,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/platform.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
 #include <rex/graphics/pipeline/shader/shader.h>
@@ -60,8 +61,12 @@ REXCVAR_DEFINE_BOOL(vulkan_async_skip_incomplete_frames, true, "GPU/Vulkan",
                     "used placeholder pipelines to avoid visible flashing")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
-REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, true, "GPU/Vulkan",
-                    "Submit command buffer when PM4 primary buffer ends")
+// Submitting on every primary-buffer boundary produces many tiny submits, each
+// forcing a tile flush/restore on mobile tilers. Default off on Android/arm64
+// handhelds so submits coalesce to frame granularity; keep it on for desktop.
+REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, !REX_PLATFORM_ANDROID, "GPU/Vulkan",
+                    "Submit command buffer when PM4 primary buffer ends (off by default on "
+                    "mobile to coalesce submits to frame granularity)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
@@ -4340,7 +4345,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
   const uint32_t read_index = 1 - write_index;
   const uint32_t readback_size = AlignReadbackBufferSize(total_size);
   if (!ensure_readback_slot(write_index, readback_size)) {
-    return IssueDraw_MemexportReadbackFullPath(total_size);
+    // Slot allocation failed; skip this draw's readback rather than draining the
+    // draw thread to GPU-idle. The range stays GPU-dirty (RangeWrittenByGpu was
+    // already called) and will be picked up on a later draw.
+    return true;
   }
 
   shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
@@ -4370,7 +4378,10 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
       total_size <= readback.written_size[read_index] && readback.submission_written[read_index] &&
       readback.submission_written[read_index] <= submission_completed_;
   if (!previous_slot_ready) {
-    IssueDraw_MemexportReadbackFullPath(total_size);
+    // The other slot's copy hasn't completed yet (e.g. first use of this key).
+    // Don't fall back to the synchronous full path - that drains the draw thread
+    // to GPU-idle inline. The write slot's copy is queued for a future frame;
+    // skip the CPU read this draw and consume it once the slot is signalled.
     readback.current_index = read_index;
     return true;
   }
@@ -4796,6 +4807,10 @@ bool VulkanCommandProcessor::InitializeOcclusionQueryResources() {
 void VulkanCommandProcessor::ShutdownOcclusionQueryResources() {
   DisableHostOcclusionQueries();
 
+  // Drop any deferred resolves; their readback buffer is about to be freed.
+  pending_occlusion_resolves_.clear();
+  occlusion_last_results_.clear();
+
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   VkDevice device = vulkan_device->device();
@@ -4896,33 +4911,86 @@ bool VulkanCommandProcessor::EndGuestOcclusionQuery(uint32_t sample_count_addres
                                            sizeof(uint64_t) * host_index, sizeof(uint64_t),
                                            VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
 
-  if (!EndSubmission(false)) {
-    return false;
+  // Defer the CPU-side read instead of draining the GPU inline. The old path
+  // ended the submission and blocked on vkWaitForFences(UINT64_MAX) here, a hard
+  // CPU<->GPU serialization (potentially several times per frame) that discards
+  // in-flight tile work - a tiler killer on arm64 handhelds. Leave the copy
+  // batched in the current submission and read its result from an already-
+  // signalled submission on a later frame.
+  PendingOcclusionResolve pending;
+  pending.sample_count_address = sample_count_address;
+  pending.host_index = host_index;
+  pending.submission_index = GetCurrentSubmission();
+  pending_occlusion_resolves_.push_back(pending);
+
+  // Consume any deferred results whose submissions have already completed (this
+  // only polls fences, it never blocks).
+  ResolveCompletedOcclusionQueries();
+
+  // Give the guest a plausible result synchronously so it never reads the
+  // unfinished-query sentinel: the most recent value read back for this target,
+  // or the configured fake sample count (matching the non-host-query fallback).
+  auto last_it = occlusion_last_results_.find(sample_count_address);
+  if (last_it != occlusion_last_results_.end()) {
+    WriteGuestOcclusionResult(sample_count_address, last_it->second);
+  } else {
+    auto fake_sample_count = REXCVAR_GET(query_occlusion_fake_sample_count);
+    if (fake_sample_count >= 0) {
+      WriteGuestOcclusionResult(sample_count_address, uint64_t(fake_sample_count));
+    }
   }
-  if (!AwaitAllQueueOperationsCompletion()) {
-    return false;
+
+  // Backstop: if submissions stop completing, fall back to a single blocking
+  // resolve so the deferral queue (and the host query-pool slots it pins) can't
+  // grow without bound. This is the only path that may still wait, and only
+  // under pathological non-progress.
+  if (pending_occlusion_resolves_.size() > kMaxPendingOcclusionResolves) {
+    if (AwaitAllQueueOperationsCompletion()) {
+      ResolveCompletedOcclusionQueries();
+    }
   }
+  return true;
+}
+
+void VulkanCommandProcessor::ResolveCompletedOcclusionQueries() {
+  if (pending_occlusion_resolves_.empty() || occlusion_query_readback_mapping_ == nullptr) {
+    return;
+  }
+
+  // Advance submission_completed_ without blocking (timeout-0 fence polling).
+  CheckSubmissionFenceAndDeviceLoss(0);
 
   const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
   const VkDevice device = vulkan_device->device();
-  if (!(vulkan_device->memory_types().host_coherent &
-        (uint32_t(1) << occlusion_query_readback_memory_type_))) {
-    VkMappedMemoryRange memory_range = {};
-    memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
-    memory_range.memory = occlusion_query_readback_memory_;
-    memory_range.offset = 0;
-    memory_range.size =
-        std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
-                               vulkan_device->properties().nonCoherentAtomSize),
-                 occlusion_query_readback_memory_size_);
-    dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
-  }
+  const bool host_coherent =
+      (vulkan_device->memory_types().host_coherent &
+       (uint32_t(1) << occlusion_query_readback_memory_type_)) != 0;
 
-  const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
-  uint64_t samples = NormalizeOcclusionSamples(results[host_index]);
-  WriteGuestOcclusionResult(sample_count_address, samples);
-  return true;
+  bool invalidated = false;
+  while (!pending_occlusion_resolves_.empty()) {
+    const PendingOcclusionResolve& pending = pending_occlusion_resolves_.front();
+    if (pending.submission_index > submission_completed_) {
+      break;
+    }
+    if (!host_coherent && !invalidated) {
+      VkMappedMemoryRange memory_range = {};
+      memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
+      memory_range.memory = occlusion_query_readback_memory_;
+      memory_range.offset = 0;
+      memory_range.size =
+          std::min(rex::round_up(VkDeviceSize(sizeof(uint64_t) * kMaxOcclusionQueries),
+                                 vulkan_device->properties().nonCoherentAtomSize),
+                   occlusion_query_readback_memory_size_);
+      dfn.vkInvalidateMappedMemoryRanges(device, 1, &memory_range);
+      invalidated = true;
+    }
+    const uint64_t* results = reinterpret_cast<const uint64_t*>(occlusion_query_readback_mapping_);
+    uint64_t samples = NormalizeOcclusionSamples(results[pending.host_index]);
+    WriteGuestOcclusionResult(pending.sample_count_address, samples);
+    occlusion_last_results_[pending.sample_count_address] = samples;
+    pending_occlusion_resolves_.pop_front();
+  }
 }
 
 uint64_t VulkanCommandProcessor::NormalizeOcclusionSamples(uint64_t samples) const {
@@ -6592,32 +6660,25 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     sampler_count_pixel = 0;
     texture_count_pixel = 0;
   }
-  // TODO(Triang3l): Reuse texture and sampler bindings if not changed.
-  current_graphics_descriptor_set_values_up_to_date_ &=
-      ~((UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
-
-  // Make sure new descriptor sets are bound to the command buffer.
-
-  current_graphics_descriptor_sets_bound_up_to_date_ &=
-      current_graphics_descriptor_set_values_up_to_date_;
-
-  // Fill the texture and sampler write image infos.
-
-  bool write_vertex_textures =
-      (texture_count_vertex || sampler_count_vertex) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
-  bool write_pixel_textures =
-      (texture_count_pixel || sampler_count_pixel) &&
-      !(current_graphics_descriptor_set_values_up_to_date_ &
-        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
+  // Reuse the texture+sampler descriptor set across draws when the resolved
+  // image views and samplers are byte-for-byte identical to the set last written
+  // this frame for the same pipeline layout. This mirrors the gating already
+  // applied to the constant buffers above and avoids re-allocating and
+  // re-writing a descriptor set (plus the rebind) on every draw - a major
+  // per-draw cost on tiled mobile GPUs. (Replaces the old unconditional
+  // invalidate-every-draw behavior.)
+  //
+  // Resolve the image infos first, regardless of reuse, so a content hash can be
+  // computed; the resolve itself is cheap. What a cache hit skips is the
+  // descriptor-set allocation, vkUpdateDescriptorSets and the rebind.
+  const bool have_vertex_textures = (texture_count_vertex || sampler_count_vertex);
+  const bool have_pixel_textures = (texture_count_pixel || sampler_count_pixel);
   descriptor_write_image_info_.clear();
   descriptor_write_image_info_.reserve(
-      (write_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
-      (write_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
+      (have_vertex_textures ? texture_count_vertex + sampler_count_vertex : 0) +
+      (have_pixel_textures ? texture_count_pixel + sampler_count_pixel : 0));
   size_t vertex_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && texture_count_vertex) {
+  if (have_vertex_textures && texture_count_vertex) {
     for (const VulkanShader::TextureBinding& texture_binding : textures_vertex) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6629,7 +6690,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t vertex_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_vertex_textures && sampler_count_vertex) {
+  if (have_vertex_textures && sampler_count_vertex) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_vertex_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
@@ -6637,7 +6698,7 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_texture_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && texture_count_pixel) {
+  if (have_pixel_textures && texture_count_pixel) {
     for (const VulkanShader::TextureBinding& texture_binding : *textures_pixel) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.imageView = texture_cache_->GetActiveBindingOrNullImageView(
@@ -6649,13 +6710,86 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     }
   }
   size_t pixel_sampler_image_info_offset = descriptor_write_image_info_.size();
-  if (write_pixel_textures && sampler_count_pixel) {
+  if (have_pixel_textures && sampler_count_pixel) {
     for (const std::pair<VulkanTextureCache::SamplerParameters, VkSampler>& sampler_pair :
          current_samplers_pixel_) {
       VkDescriptorImageInfo& descriptor_image_info = descriptor_write_image_info_.emplace_back();
       descriptor_image_info.sampler = sampler_pair.second;
     }
   }
+
+  // Hash each stage's resolved image infos (the texture image views and the
+  // samplers are stored contiguously per stage). Unused VkDescriptorImageInfo
+  // members are zero-initialized by emplace_back(), so the byte hash is
+  // deterministic across draws.
+  uint64_t vertex_textures_hash = 0;
+  if (have_vertex_textures) {
+    vertex_textures_hash = uint64_t(XXH3_64bits(
+        descriptor_write_image_info_.data() + vertex_texture_image_info_offset,
+        size_t(texture_count_vertex + sampler_count_vertex) * sizeof(VkDescriptorImageInfo)));
+  }
+  uint64_t pixel_textures_hash = 0;
+  if (have_pixel_textures) {
+    pixel_textures_hash = uint64_t(XXH3_64bits(
+        descriptor_write_image_info_.data() + pixel_texture_image_info_offset,
+        size_t(texture_count_pixel + sampler_count_pixel) * sizeof(VkDescriptorImageInfo)));
+  }
+
+  // A cached descriptor set is reusable only within the same frame (transient
+  // sets are recycled per frame) and for the same pipeline layout.
+  bool reuse_vertex_textures =
+      have_vertex_textures && texture_descriptor_set_reuse_vertex_.valid &&
+      texture_descriptor_set_reuse_vertex_.descriptor_set != VK_NULL_HANDLE &&
+      texture_descriptor_set_reuse_vertex_.frame == frame_current_ &&
+      texture_descriptor_set_reuse_vertex_.pipeline_layout ==
+          current_guest_graphics_pipeline_layout_ &&
+      texture_descriptor_set_reuse_vertex_.hash == vertex_textures_hash;
+  bool reuse_pixel_textures =
+      have_pixel_textures && texture_descriptor_set_reuse_pixel_.valid &&
+      texture_descriptor_set_reuse_pixel_.descriptor_set != VK_NULL_HANDLE &&
+      texture_descriptor_set_reuse_pixel_.frame == frame_current_ &&
+      texture_descriptor_set_reuse_pixel_.pipeline_layout ==
+          current_guest_graphics_pipeline_layout_ &&
+      texture_descriptor_set_reuse_pixel_.hash == pixel_textures_hash;
+
+  // Invalidate the texture value bits unless a stage can be reused. On reuse,
+  // keep the value bit set and restore the cached set handle so the existing
+  // binding remains valid (the set is guaranteed alive: same frame, same
+  // layout, identical contents).
+  uint32_t texture_value_bits_to_clear =
+      (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex) |
+      (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+  if (reuse_vertex_textures) {
+    texture_value_bits_to_clear &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex);
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
+        texture_descriptor_set_reuse_vertex_.descriptor_set;
+  }
+  if (reuse_pixel_textures) {
+    texture_value_bits_to_clear &=
+        ~(UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel);
+    current_graphics_descriptor_set_values_up_to_date_ |=
+        UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
+    current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
+        texture_descriptor_set_reuse_pixel_.descriptor_set;
+  }
+  current_graphics_descriptor_set_values_up_to_date_ &= ~texture_value_bits_to_clear;
+
+  // Make sure new descriptor sets are bound to the command buffer.
+
+  current_graphics_descriptor_sets_bound_up_to_date_ &=
+      current_graphics_descriptor_set_values_up_to_date_;
+
+  bool write_vertex_textures =
+      have_vertex_textures &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex));
+  bool write_pixel_textures =
+      have_pixel_textures &&
+      !(current_graphics_descriptor_set_values_up_to_date_ &
+        (UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel));
 
   // Write the new descriptor sets.
 
@@ -6721,6 +6855,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesVertex;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesVertex] =
         write_textures[0].dstSet;
+    // Record for cross-draw reuse while these bindings stay unchanged.
+    texture_descriptor_set_reuse_vertex_.hash = vertex_textures_hash;
+    texture_descriptor_set_reuse_vertex_.descriptor_set = write_textures[0].dstSet;
+    texture_descriptor_set_reuse_vertex_.frame = frame_current_;
+    texture_descriptor_set_reuse_vertex_.pipeline_layout = current_guest_graphics_pipeline_layout_;
+    texture_descriptor_set_reuse_vertex_.valid = true;
   }
   // Pixel shader textures and samplers.
   if (write_pixel_textures) {
@@ -6738,6 +6878,12 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
     write_descriptor_set_bits |= UINT32_C(1) << SpirvShaderTranslator::kDescriptorSetTexturesPixel;
     current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel] =
         write_textures[0].dstSet;
+    // Record for cross-draw reuse while these bindings stay unchanged.
+    texture_descriptor_set_reuse_pixel_.hash = pixel_textures_hash;
+    texture_descriptor_set_reuse_pixel_.descriptor_set = write_textures[0].dstSet;
+    texture_descriptor_set_reuse_pixel_.frame = frame_current_;
+    texture_descriptor_set_reuse_pixel_.pipeline_layout = current_guest_graphics_pipeline_layout_;
+    texture_descriptor_set_reuse_pixel_.valid = true;
   }
   // Write.
   if (write_descriptor_set_count) {

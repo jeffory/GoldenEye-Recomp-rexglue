@@ -54,6 +54,13 @@ REXCVAR_DEFINE_BOOL(ffmpeg_verbose, false, "Audio", "Verbose FFmpeg output (debu
 
 namespace rex::audio {
 
+// Upper bound on how long an XMA kick blocks the guest thread waiting for the
+// worker, shared across every context kicked by a single register write. Sized
+// to roughly one 30fps frame so a stall can never blow the whole frame budget;
+// kicked contexts are decoded first (see WorkerThreadMain) so this ceiling is
+// rarely reached in practice.
+static constexpr std::chrono::milliseconds kKickWaitBudget{33};
+
 XmaDecoder::XmaDecoder(runtime::FunctionDispatcher* function_dispatcher)
     : memory_(function_dispatcher->memory()), function_dispatcher_(function_dispatcher) {}
 
@@ -139,8 +146,28 @@ X_STATUS XmaDecoder::Setup(system::KernelState* kernel_state) {
 
 void XmaDecoder::WorkerThreadMain() {
   while (worker_running_) {
-    // Okay, let's loop through XMA contexts to find ones we need to decode!
     bool did_work = false;
+
+    // Decode freshly-kicked contexts first. The guest blocks (with a timeout)
+    // on these specific contexts in WriteRegister, so servicing them ahead of
+    // the linear scan keeps an XMA kick from waiting behind unrelated contexts.
+    std::queue<uint32_t> kicked;
+    {
+      std::lock_guard<std::mutex> lock(kick_lock_);
+      kicked.swap(kicked_contexts_);
+    }
+    while (!kicked.empty() && worker_running_) {
+      uint32_t n = kicked.front();
+      kicked.pop();
+      XmaContext& context = contexts_[n];
+      if (context.Work()) {
+        context.SignalWorkDone();
+        PROFILE_XMA_FRAME_DECODED();
+        did_work = true;
+      }
+    }
+
+    // Sweep the rest for any context still flagged for work.
     for (uint32_t n = 0; n < kContextCount && worker_running_; n++) {
       XmaContext& context = contexts_[n];
       bool worked = context.Work();
@@ -286,20 +313,44 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // The context ID is a bit in the range of the entire context array.
     uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
     uint32_t kicked_value = value;
+
+    // Enable each kicked context.
     for (int i = 0; value && i < 32; ++i, value >>= 1) {
       if (value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = contexts_[context_id];
-        context.Enable();
+        contexts_[base_context_id + i].Enable();
       }
     }
+
+    // Queue the kicked contexts so the worker decodes them ahead of its linear
+    // scan. Held only for the pushes -- no blocking calls under the lock.
+    {
+      std::lock_guard<std::mutex> lock(kick_lock_);
+      uint32_t queue_value = kicked_value;
+      for (int i = 0; queue_value && i < 32; ++i, queue_value >>= 1) {
+        if (queue_value & 1) {
+          kicked_contexts_.push(base_context_id + i);
+        }
+      }
+    }
+
     // Signal the decoder thread to start processing.
     work_event_->Set();
-    // Block until the worker finishes, so the game sees updated context data.
+
+    // Wait for the worker to finish, so the game sees updated context data --
+    // but only up to a bounded budget shared across all contexts kicked by this
+    // write. This keeps an audio-heavy scene from stalling the guest thread on
+    // a long run of synchronous FFmpeg decodes; anything not ready in time is
+    // picked up by the worker and observed by the game on a later poll.
+    const auto deadline = std::chrono::steady_clock::now() + kKickWaitBudget;
     for (int i = 0; kicked_value && i < 32; ++i, kicked_value >>= 1) {
       if (kicked_value & 1) {
         uint32_t context_id = base_context_id + i;
-        contexts_[context_id].WaitForWorkDone();
+        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining < std::chrono::milliseconds::zero()) {
+          remaining = std::chrono::milliseconds::zero();
+        }
+        contexts_[context_id].WaitForWorkDone(remaining);
       }
     }
   } else if (r >= XmaRegister::Context0Lock && r <= XmaRegister::Context9Lock) {
@@ -312,10 +363,12 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
         uint32_t context_id = base_context_id + i;
         auto& context = contexts_[context_id];
         context.Disable();
-        // [XMA fix] Added Block(false) after Disable(). Without this, the game
-        // could call XMADisableContext and start modifying the context struct
-        // while a decode was still in progress on the worker thread. Block()
-        // waits for the context mutex to be free (poll=false means wait, not spin).
+        // Wait for the worker to leave its decode pass before the game starts
+        // modifying the context struct. Disable() already cleared the enable
+        // flag and asked the worker to break out of its decode loop after the
+        // current frame, so Block() now returns within (at most) one frame
+        // instead of blocking on a full multi-frame decode. poll=false means
+        // wait for the mutex, not spin.
         context.Block(false);
       }
     }

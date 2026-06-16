@@ -21,6 +21,10 @@
 #include <rex/platform.h>
 #include <rex/stream.h>
 
+#if REX_ARCH_ARM64
+#include <arm_neon.h>
+#endif
+
 extern "C" {
 #if REX_COMPILER_MSVC
 #pragma warning(push)
@@ -99,6 +103,8 @@ bool XmaContext::Work() {
 
   std::lock_guard<std::mutex> lock(lock_);
   set_is_enabled(false);
+  // Fresh decode pass: forget any disable request from a previous cycle.
+  disable_requested_.store(false, std::memory_order_release);
 
   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
   XMA_CONTEXT_DATA data(context_ptr);
@@ -137,6 +143,13 @@ bool XmaContext::Work() {
     Consume(&output_rb, &data);
 
     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+      break;
+    }
+
+    // The game disabled this context (XMADisableContext) mid-pass. Stop after
+    // the current frame so the disabling guest thread isn't held for a full
+    // multi-frame decode.
+    if (disable_requested_.load(std::memory_order_acquire)) {
       break;
     }
   }
@@ -192,7 +205,13 @@ void XmaContext::ClearLocked(XMA_CONTEXT_DATA* data) {
 }
 
 void XmaContext::Disable() {
-  std::lock_guard<std::mutex> lock(lock_);
+  // Don't take lock_ here. The worker may hold it for a full decode, and the
+  // old code blocked the guest thread (XMADisableContext) for that whole time.
+  // Clearing these atomics lets the worker observe the disable and break out of
+  // its decode loop between frames (see Work()); the caller then only waits, via
+  // Block(), for the worker to finish the current frame rather than the whole
+  // decode pass.
+  disable_requested_.store(true, std::memory_order_release);
   set_is_enabled(false);
 }
 
@@ -745,6 +764,43 @@ void XmaContext::ConvertFrame(const uint8_t** samples, bool is_two_channel,
       out_mm = _mm_shuffle_epi8(out_mm, shufmask);
       // Store, as [out + i * 2] movdqu.
       _mm_storeu_si128(reinterpret_cast<__m128i*>(&out[i]), out_mm);
+    }
+  }
+#elif REX_ARCH_ARM64
+  // NEON port of the SSE path above: rescale, round to int32, saturating-narrow
+  // to int16, interleave channels (stereo), then byte-swap each lane to big
+  // endian. vcvtnq rounds to nearest-even to match _mm_cvtps_epi32.
+  static_assert(kSamplesPerFrame % 8 == 0);
+  const auto in_channel_0 = reinterpret_cast<const float*>(samples[0]);
+  const float32x4_t scale_q = vdupq_n_f32(scale);
+  if (is_two_channel) {
+    const auto in_channel_1 = reinterpret_cast<const float*>(samples[1]);
+    for (uint32_t i = 0; i < kSamplesPerFrame; i += 4) {
+      // Load 4 samples per channel and rescale.
+      float32x4_t in0 = vmulq_f32(vld1q_f32(&in_channel_0[i]), scale_q);
+      float32x4_t in1 = vmulq_f32(vld1q_f32(&in_channel_1[i]), scale_q);
+      // Round to int32, saturating-narrow to int16.
+      int16x4_t s0 = vqmovn_s32(vcvtnq_s32_f32(in0));
+      int16x4_t s1 = vqmovn_s32(vcvtnq_s32_f32(in1));
+      // Interleave channels: [c0_0, c1_0, c0_1, c1_1, ...].
+      int16x4x2_t zipped = vzip_s16(s0, s1);
+      int16x8_t interleaved = vcombine_s16(zipped.val[0], zipped.val[1]);
+      // Byte-swap each 16-bit lane and store 4 stereo frames.
+      uint8x16_t swapped = vrev16q_u8(vreinterpretq_u8_s16(interleaved));
+      vst1q_u8(reinterpret_cast<uint8_t*>(&out[i * 2]), swapped);
+    }
+  } else {
+    for (uint32_t i = 0; i < kSamplesPerFrame; i += 8) {
+      // Load 8 samples and rescale.
+      float32x4_t in0 = vmulq_f32(vld1q_f32(&in_channel_0[i]), scale_q);
+      float32x4_t in1 = vmulq_f32(vld1q_f32(&in_channel_0[i + 4]), scale_q);
+      // Round to int32, saturating-narrow to int16, keep sample order.
+      int16x4_t s0 = vqmovn_s32(vcvtnq_s32_f32(in0));
+      int16x4_t s1 = vqmovn_s32(vcvtnq_s32_f32(in1));
+      int16x8_t packed = vcombine_s16(s0, s1);
+      // Byte-swap each 16-bit lane and store 8 samples.
+      uint8x16_t swapped = vrev16q_u8(vreinterpretq_u8_s16(packed));
+      vst1q_u8(reinterpret_cast<uint8_t*>(&out[i]), swapped);
     }
   }
 #else

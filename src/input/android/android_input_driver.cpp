@@ -95,7 +95,21 @@ constexpr uint16_t kDpadMask = X_INPUT_GAMEPAD_DPAD_LEFT | X_INPUT_GAMEPAD_DPAD_
 AndroidInputDriver::AndroidInputDriver(rex::ui::Window* window, size_t window_z_order)
     : InputDriver(window, window_z_order) {}
 
-AndroidInputDriver::~AndroidInputDriver() = default;
+AndroidInputDriver::~AndroidInputDriver() {
+  if (!jni_cached_) {
+    return;
+  }
+  JNIEnv* env = rex::GetAndroidJniEnv();
+  if (!env) {
+    return;
+  }
+  if (vibrator_global_) {
+    env->DeleteGlobalRef(vibrator_global_);
+  }
+  if (eff_cls_global_) {
+    env->DeleteGlobalRef(eff_cls_global_);
+  }
+}
 
 X_STATUS AndroidInputDriver::Setup() {
   return X_STATUS_SUCCESS;
@@ -136,14 +150,14 @@ int32_t AndroidInputDriver::HandleKey(AInputEvent* event) {
 
   // Some controllers deliver the analog triggers as L2/R2 button presses.
   if (keycode == AKEYCODE_BUTTON_L2 || keycode == AKEYCODE_BUTTON_R2) {
-    std::lock_guard<std::mutex> lock(mutex_);
     uint8_t value = down ? 255 : 0;
     if (keycode == AKEYCODE_BUTTON_L2) {
-      left_trigger_ = value;
+      w_state_.left_trigger = value;
     } else {
-      right_trigger_ = value;
+      w_state_.right_trigger = value;
     }
-    ++packet_number_;
+    ++w_state_.packet_number;
+    snapshot_.store(w_state_, std::memory_order_release);
     return 1;
   }
 
@@ -151,13 +165,13 @@ int32_t AndroidInputDriver::HandleKey(AInputEvent* event) {
   if (!bit) {
     return 0;
   }
-  std::lock_guard<std::mutex> lock(mutex_);
   if (down) {
-    buttons_ |= bit;
+    w_state_.buttons |= bit;
   } else {
-    buttons_ &= ~bit;
+    w_state_.buttons &= ~bit;
   }
-  ++packet_number_;
+  ++w_state_.packet_number;
+  snapshot_.store(w_state_, std::memory_order_release);
   return 1;
 }
 
@@ -183,27 +197,27 @@ int32_t AndroidInputDriver::HandleMotion(AInputEvent* event) {
   float hat_x = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_X, 0);
   float hat_y = AMotionEvent_getAxisValue(event, AMOTION_EVENT_AXIS_HAT_Y, 0);
 
-  std::lock_guard<std::mutex> lock(mutex_);
-  thumb_lx_ = StickToAxis(lx);
-  thumb_ly_ = StickToAxis(-ly);  // Android Y is down-positive; XInput is up-positive.
-  thumb_rx_ = StickToAxis(rx);
-  thumb_ry_ = StickToAxis(-ry);
-  left_trigger_ = TriggerToByte(lt);
-  right_trigger_ = TriggerToByte(rt);
+  w_state_.thumb_lx = StickToAxis(lx);
+  w_state_.thumb_ly = StickToAxis(-ly);  // Android Y is down-positive; XInput is up-positive.
+  w_state_.thumb_rx = StickToAxis(rx);
+  w_state_.thumb_ry = StickToAxis(-ry);
+  w_state_.left_trigger = TriggerToByte(lt);
+  w_state_.right_trigger = TriggerToByte(rt);
   // D-pad reported as a hat axis (controllers that send it as keys go through
   // HandleKey instead).
-  buttons_ &= ~kDpadMask;
+  w_state_.buttons &= ~kDpadMask;
   if (hat_x < -0.5f) {
-    buttons_ |= X_INPUT_GAMEPAD_DPAD_LEFT;
+    w_state_.buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
   } else if (hat_x > 0.5f) {
-    buttons_ |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+    w_state_.buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
   }
   if (hat_y < -0.5f) {
-    buttons_ |= X_INPUT_GAMEPAD_DPAD_UP;
+    w_state_.buttons |= X_INPUT_GAMEPAD_DPAD_UP;
   } else if (hat_y > 0.5f) {
-    buttons_ |= X_INPUT_GAMEPAD_DPAD_DOWN;
+    w_state_.buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
   }
-  ++packet_number_;
+  ++w_state_.packet_number;
+  snapshot_.store(w_state_, std::memory_order_release);
   return 1;
 }
 
@@ -235,15 +249,17 @@ X_RESULT AndroidInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_st
     return X_ERROR_DEVICE_NOT_CONNECTED;
   }
   if (out_state) {
-    std::lock_guard<std::mutex> lock(mutex_);
-    out_state->packet_number = packet_number_;
-    out_state->gamepad.buttons = buttons_;
-    out_state->gamepad.left_trigger = left_trigger_;
-    out_state->gamepad.right_trigger = right_trigger_;
-    out_state->gamepad.thumb_lx = thumb_lx_;
-    out_state->gamepad.thumb_ly = thumb_ly_;
-    out_state->gamepad.thumb_rx = thumb_rx_;
-    out_state->gamepad.thumb_ry = thumb_ry_;
+    // Lock-free acquire load: pairs with the release stores in HandleKey/HandleMotion.
+    // On AArch64 this compiles to a single LDXP (or LDP with a DMB barrier).
+    InputSnapshot s = snapshot_.load(std::memory_order_acquire);
+    out_state->packet_number = s.packet_number;
+    out_state->gamepad.buttons = s.buttons;
+    out_state->gamepad.left_trigger = s.left_trigger;
+    out_state->gamepad.right_trigger = s.right_trigger;
+    out_state->gamepad.thumb_lx = s.thumb_lx;
+    out_state->gamepad.thumb_ly = s.thumb_ly;
+    out_state->gamepad.thumb_rx = s.thumb_rx;
+    out_state->gamepad.thumb_ry = s.thumb_ry;
   }
   return X_ERROR_SUCCESS;
 }
@@ -254,55 +270,65 @@ void AndroidInputDriver::Vibrate(uint16_t left_motor, uint16_t right_motor) {
   if (!env || !activity) {
     return;
   }
-  if (env->PushLocalFrame(16) != 0) {
+
+  // Cache all stable JNI handles on first call: class/method lookups are
+  // expensive; caching drops per-call JNI overhead from ~8 lookups to ~2 calls.
+  if (!jni_cached_) {
+    jni_cached_ = true;  // set unconditionally so failures don't cause retry loops
+    if (env->PushLocalFrame(8) == 0) {
+      jclass act_cls = env->GetObjectClass(activity);
+      jmethodID m_get_service =
+          act_cls ? env->GetMethodID(act_cls, "getSystemService",
+                                     "(Ljava/lang/String;)Ljava/lang/Object;")
+                  : nullptr;
+      jstring svc_str = env->NewStringUTF("vibrator");
+      jobject vib_local = (m_get_service && svc_str && !env->ExceptionCheck())
+                              ? env->CallObjectMethod(activity, m_get_service, svc_str)
+                              : nullptr;
+      if (vib_local && !env->ExceptionCheck()) {
+        vibrator_global_ = env->NewGlobalRef(vib_local);
+        jclass vib_cls = env->GetObjectClass(vib_local);
+        if (vib_cls) {
+          m_cancel_ = env->GetMethodID(vib_cls, "cancel", "()V");
+          m_vibrate_ =
+              env->GetMethodID(vib_cls, "vibrate", "(Landroid/os/VibrationEffect;)V");
+        }
+      }
+      jclass eff_local = env->FindClass("android/os/VibrationEffect");
+      if (eff_local && !env->ExceptionCheck()) {
+        eff_cls_global_ = static_cast<jclass>(env->NewGlobalRef(eff_local));
+        m_create_oneshot_ = env->GetStaticMethodID(eff_cls_global_, "createOneShot",
+                                                   "(JI)Landroid/os/VibrationEffect;");
+      }
+      if (env->ExceptionCheck()) {
+        env->ExceptionClear();
+      }
+      env->PopLocalFrame(nullptr);
+    }
+  }
+
+  if (!vibrator_global_) {
     return;
   }
-  do {
-    // Vibrator v = (Vibrator) activity.getSystemService("vibrator");
-    jclass act_cls = env->GetObjectClass(activity);
-    jmethodID m_get_service =
-        env->GetMethodID(act_cls, "getSystemService", "(Ljava/lang/String;)Ljava/lang/Object;");
-    if (!m_get_service) {
-      break;
-    }
-    jstring svc = env->NewStringUTF("vibrator");
-    jobject vibrator = env->CallObjectMethod(activity, m_get_service, svc);
-    if (!vibrator || env->ExceptionCheck()) {
-      break;
-    }
-    jclass vib_cls = env->GetObjectClass(vibrator);
+  if (env->PushLocalFrame(4) != 0) {
+    return;
+  }
 
-    uint16_t magnitude = left_motor > right_motor ? left_motor : right_motor;
-    if (magnitude == 0) {
-      jmethodID m_cancel = env->GetMethodID(vib_cls, "cancel", "()V");
-      if (m_cancel) {
-        env->CallVoidMethod(vibrator, m_cancel);
-      }
-      break;
+  uint16_t magnitude = left_motor > right_motor ? left_motor : right_motor;
+  if (magnitude == 0) {
+    if (m_cancel_) {
+      env->CallVoidMethod(vibrator_global_, m_cancel_);
     }
-
-    // VibrationEffect e = VibrationEffect.createOneShot(120ms, amplitude 1..255);
-    // v.vibrate(e). (minSdk 29, so VibrationEffect is always available.)
-    jclass eff_cls = env->FindClass("android/os/VibrationEffect");
-    jmethodID m_create =
-        eff_cls ? env->GetStaticMethodID(eff_cls, "createOneShot",
-                                         "(JI)Landroid/os/VibrationEffect;")
-                : nullptr;
-    if (!m_create) {
-      break;
-    }
+  } else if (eff_cls_global_ && m_create_oneshot_ && m_vibrate_) {
+    // VibrationEffect.createOneShot(120ms, amplitude 1..255)  then v.vibrate(e).
+    // (minSdk 29, so VibrationEffect is always available.)
     jint amplitude = 1 + (static_cast<int>(magnitude) * 254) / 65535;
-    jobject effect = env->CallStaticObjectMethod(eff_cls, m_create, static_cast<jlong>(120),
-                                                 amplitude);
-    if (!effect || env->ExceptionCheck()) {
-      break;
+    jobject effect = env->CallStaticObjectMethod(eff_cls_global_, m_create_oneshot_,
+                                                static_cast<jlong>(120), amplitude);
+    if (effect && !env->ExceptionCheck()) {
+      env->CallVoidMethod(vibrator_global_, m_vibrate_, effect);
     }
-    jmethodID m_vibrate =
-        env->GetMethodID(vib_cls, "vibrate", "(Landroid/os/VibrationEffect;)V");
-    if (m_vibrate) {
-      env->CallVoidMethod(vibrator, m_vibrate, effect);
-    }
-  } while (false);
+  }
 
   if (env->ExceptionCheck()) {
     env->ExceptionClear();

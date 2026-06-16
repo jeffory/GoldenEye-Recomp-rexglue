@@ -111,9 +111,37 @@ void AndroidWindowedAppContext::RunMainAndroidLoop() {
       // RequestPaintImpl is a no-op (there's no OS-driven repaint callback like
       // GTK's draw signal), so without this the presenter's PaintAndPresent is
       // never called and the guest output is never composited to the swapchain
-      // -> black screen. force_paint=true: the swapchain image isn't retained
-      // between frames, so always re-present the latest guest output.
+      // -> black screen. PaintFromUiThreadIfRequested() only paints when a
+      // frame was actually requested, and forces the present through because
+      // the swapchain image isn't retained between frames (see window_android.h).
+      //
+      // This present can BLOCK on swapchain acquire/present for up to a full
+      // refresh (FIFO vsync wait). Ideally the present would run off this loop
+      // thread entirely (the presenter's kGuestOutputThreadImmediately path),
+      // but that path is gated by host_present_from_non_ui_thread AND disabled
+      // whenever the surface has implicit vsync - which an Android FIFO
+      // swapchain always does - so it falls back to UI-thread present here.
+      // To keep a present stall from delaying input/lifecycle by a whole
+      // iteration, re-service the looper non-blocking and re-drain input right
+      // after the present returns, instead of waiting for the next frame-paced
+      // ALooper_pollOnce(16ms) at the top of the loop.
       window_->PaintFromUiThreadIfRequested();
+
+      int post_events;
+      android_poll_source* post_source = nullptr;
+      // timeout 0: drain only what is already ready, never block (a blocking
+      // wait here would defeat the frame pacing and burn a core).
+      while (ALooper_pollOnce(0, nullptr, &post_events,
+                              reinterpret_cast<void**>(&post_source)) >= 0) {
+        if (post_source) {
+          post_source->process(app_, post_source);
+        }
+      }
+      DrainAndroidInputQueue(app_);
+      if (app_->destroyRequested) {
+        QuitFromUIThread();
+        return;
+      }
     }
   }
 }

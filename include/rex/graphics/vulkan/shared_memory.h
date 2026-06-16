@@ -76,6 +76,13 @@ class VulkanSharedMemory : public SharedMemory {
   Usage last_usage_;
   std::pair<uint32_t, uint32_t> last_written_range_;
 
+  // On unified-memory (UMA) devices the buffer is allocated with a memory type
+  // that is both DEVICE_LOCAL and HOST_VISIBLE, so uploads skip the staging
+  // buffer and write directly into the device buffer in one memcpy.
+  bool is_uma_ = false;
+  VkDeviceSize buffer_memory_size_ = 0;
+  void* buffer_host_mapping_ = nullptr;
+
   std::unique_ptr<ui::vulkan::VulkanUploadBufferPool> upload_buffer_pool_;
   std::vector<VkBufferCopy> upload_regions_;
 

@@ -16,11 +16,13 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #include <atomic>
 #include <array>
 #include <cerrno>
+#include <condition_variable>
 #include <cstddef>
 #include <ctime>
 #include <deque>
 #include <limits>
 #include <memory>
+#include <mutex>
 
 #include <pthread.h>
 #include <semaphore.h>
@@ -160,6 +162,62 @@ void SyncMemory() {
   __sync_synchronize();
 }
 
+// --- Global "something became signaled" notifier ------------------------------
+//
+// A single object's condition variable can only wake threads waiting on THAT
+// object. Multi-object waits (WaitForMultipleObjects) and alertable waits (which
+// must also wake on a queued user APC, not just the object) therefore cannot
+// block on one object's CV, so historically they spun on a 1ms poll timer -
+// cheap on a desktop, but on a few-core arm64 handheld it is a steady stream of
+// timer wakeups across every blocked guest thread, and it adds up to a frame of
+// latency to every cross-object wakeup.
+//
+// Instead, every signal/release path bumps a process-wide generation counter and
+// notifies one global condition variable. A waiter snapshots the generation
+// BEFORE testing its predicate, and if the predicate is not yet satisfied it
+// blocks on this CV until the generation moves (or its own timeout fires). Any
+// signal that races in after the snapshot bumps the generation, so the blocked
+// waiter is woken (or never sleeps) - no lost wakeups, and no fixed-interval
+// polling. The generation snapshot is taken with the object mutexes released, so
+// the lock order is always object-mutex -> global-mutex and there is no deadlock.
+namespace {
+
+std::mutex g_wait_mutex;
+std::condition_variable g_wait_cv;
+std::atomic<uint64_t> g_wait_generation{0};
+
+// Called by producers after an object becomes (or may have become) signaled, and
+// after a user callback is queued onto an alertable thread.
+void NotifyGlobalWaiters() {
+  // Bump first (release) so a waiter that already snapshotted the old value sees
+  // the change in its predicate; then take the mutex briefly to close the
+  // check-then-wait race before signalling.
+  g_wait_generation.fetch_add(1, std::memory_order_release);
+  { std::lock_guard<std::mutex> lock(g_wait_mutex); }
+  g_wait_cv.notify_all();
+}
+
+// Block until the global generation moves away from gen_snapshot or the deadline
+// passes (time_point::max() == wait forever). The caller re-tests its real
+// predicate after returning; spurious returns are harmless.
+void WaitGlobalGeneration(uint64_t gen_snapshot,
+                          std::chrono::steady_clock::time_point deadline) {
+  std::unique_lock<std::mutex> lock(g_wait_mutex);
+  auto changed = [gen_snapshot] {
+    return g_wait_generation.load(std::memory_order_acquire) != gen_snapshot;
+  };
+  if (changed()) {
+    return;
+  }
+  if (deadline == std::chrono::steady_clock::time_point::max()) {
+    g_wait_cv.wait(lock, changed);
+  } else {
+    g_wait_cv.wait_until(lock, deadline, changed);
+  }
+}
+
+}  // namespace
+
 void Sleep(std::chrono::microseconds duration) {
   timespec rqtp = DurationToTimeSpec(duration);
   timespec rmtp = {};
@@ -181,6 +239,7 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
   alertable_state_ = true;
   auto deadline = std::chrono::steady_clock::now() + duration;
   while (true) {
+    uint64_t gen = g_wait_generation.load(std::memory_order_acquire);
     if (DispatchCurrentThreadUserCallback()) {
       alertable_state_ = false;
       return SleepResult::kAlerted;
@@ -190,8 +249,9 @@ SleepResult AlertableSleep(std::chrono::microseconds duration) {
       alertable_state_ = false;
       return SleepResult::kSuccess;
     }
-    auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(deadline - now);
-    Sleep(std::min(remaining, std::chrono::microseconds(1000)));
+    // Block until the alarm fires or a user callback is queued (which bumps the
+    // global generation via NotifyGlobalWaiters), instead of polling every 1ms.
+    WaitGlobalGeneration(gen, deadline);
   }
 }
 
@@ -289,6 +349,11 @@ class PosixConditionBase {
                         : start_time + timeout;
 
     while (true) {
+      // Snapshot the global generation BEFORE testing predicates: any signal that
+      // races in after this point bumps the generation, so the block below either
+      // sees the change and returns immediately or is woken by the notify.
+      uint64_t gen = g_wait_generation.load(std::memory_order_acquire);
+
       size_t first_signaled = std::numeric_limits<size_t>::max();
       bool condition_met = false;
       bool all_locked = true;
@@ -366,13 +431,11 @@ class PosixConditionBase {
         return std::make_pair<WaitResult, size_t>(WaitResult::kTimeout, 0);
       }
 
-      if (timeout == std::chrono::milliseconds::max()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(1));
-      } else {
-        auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - now);
-        auto sleep_time = std::min(remaining, std::chrono::milliseconds(1));
-        std::this_thread::sleep_for(sleep_time);
-      }
+      // Object mutexes are released; block on the global notifier until one of the
+      // handles is signalled (generation bump) or the deadline passes - no 1ms
+      // polling. Lock order is always object-mutex -> global-mutex, so this is
+      // deadlock-free.
+      WaitGlobalGeneration(gen, end_time);
     }
   }
 
@@ -402,9 +465,12 @@ class PosixCondition<Event> : public PosixConditionBase {
   virtual ~PosixCondition() = default;
 
   bool Signal() override {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
-    signal_ = true;
-    cond_.notify_all();
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      signal_ = true;
+      cond_.notify_all();
+    }
+    NotifyGlobalWaiters();
     return true;
   }
 
@@ -433,15 +499,18 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   bool Signal() override { return Release(1, nullptr); }
 
   bool Release(uint32_t release_count, int* out_previous_count) {
-    auto lock = std::unique_lock<std::mutex>(mutex_);
-    if (release_count > maximum_count_ - count_) {
-      return false;
+    {
+      auto lock = std::unique_lock<std::mutex>(mutex_);
+      if (release_count > maximum_count_ - count_) {
+        return false;
+      }
+      if (out_previous_count) {
+        *out_previous_count = count_;
+      }
+      count_ += release_count;
+      cond_.notify_all();
     }
-    if (out_previous_count) {
-      *out_previous_count = count_;
-    }
-    count_ += release_count;
-    cond_.notify_all();
+    NotifyGlobalWaiters();
     return true;
   }
 
@@ -450,6 +519,12 @@ class PosixCondition<Semaphore> : public PosixConditionBase {
   inline void post_execution() override {
     count_--;
     cond_.notify_all();
+    // A multi-object/alertable waiter may have consumed one count while another
+    // is still pending and count_ remains > 0; wake the global waiters so they
+    // re-check rather than sleep until the next Release.
+    if (count_ > 0) {
+      NotifyGlobalWaiters();
+    }
   }
   uint32_t count_;
   const uint32_t maximum_count_;
@@ -469,11 +544,18 @@ class PosixCondition<Mutant> : public PosixConditionBase {
 
   bool Release() {
     if (owner_ == std::this_thread::get_id() && count_ > 0) {
-      auto lock = std::unique_lock<std::mutex>(mutex_);
-      --count_;
-      // Free to be acquired by another thread
-      if (count_ == 0) {
-        cond_.notify_all();
+      bool released = false;
+      {
+        auto lock = std::unique_lock<std::mutex>(mutex_);
+        --count_;
+        // Free to be acquired by another thread
+        if (count_ == 0) {
+          cond_.notify_all();
+          released = true;
+        }
+      }
+      if (released) {
+        NotifyGlobalWaiters();
       }
       return true;
     }
@@ -503,9 +585,12 @@ class PosixCondition<Timer> : public PosixConditionBase {
   virtual ~PosixCondition() { Cancel(); }
 
   bool Signal() override {
-    std::lock_guard<std::mutex> lock(mutex_);
-    signal_ = true;
-    cond_.notify_all();
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      signal_ = true;
+      cond_.notify_all();
+    }
+    NotifyGlobalWaiters();
     return true;
   }
 
@@ -799,6 +884,10 @@ class PosixCondition<Thread> : public PosixConditionBase {
     if (result != 0) {
       REXSYS_WARN("QueueUserCallback: signal delivery failed ({})", result);
     }
+    // The target thread may be parked in an alertable wait on the global CV (no
+    // longer in an interruptible syscall), so the signal above is only a hint -
+    // bump the generation to wake it so it drains this callback promptly.
+    NotifyGlobalWaiters();
   }
 
   bool DispatchQueuedUserCallbacks() {
@@ -894,6 +983,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
       signaled_ = true;
       cond_.notify_all();
     }
+    NotifyGlobalWaiters();  // wake multi-object/alertable waiters joining this thread
     if (is_current_thread) {
       pthread_exit(reinterpret_cast<void*>(exit_code));
     } else {
@@ -971,8 +1061,6 @@ bool DispatchCurrentThreadUserCallback() {
 
 namespace {
 
-constexpr auto kAlertablePollSlice = std::chrono::milliseconds(1);
-
 class ScopedAlertableState {
  public:
   explicit ScopedAlertableState(bool alertable) : alertable_(alertable) {
@@ -1002,17 +1090,10 @@ bool HasAlertableTimeoutElapsed(std::chrono::steady_clock::time_point deadline) 
          std::chrono::steady_clock::now() >= deadline;
 }
 
-std::chrono::milliseconds ComputeAlertableWaitTimeout(
-    std::chrono::steady_clock::time_point deadline) {
-  if (deadline == std::chrono::steady_clock::time_point::max()) {
-    return kAlertablePollSlice;
-  }
-  auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-      deadline - std::chrono::steady_clock::now());
-  if (remaining <= std::chrono::milliseconds::zero()) {
-    return std::chrono::milliseconds::zero();
-  }
-  return std::min(remaining, kAlertablePollSlice);
+// Non-blocking poll of a single condition: consumes and returns kSuccess if the
+// object is signalled right now, otherwise kTimeout without ever sleeping.
+WaitResult TryConsume(PosixConditionBase& condition) {
+  return condition.Wait(std::chrono::milliseconds::zero());
 }
 
 }  // namespace
@@ -1068,16 +1149,22 @@ WaitResult Wait(WaitHandle* wait_handle, bool is_alertable, std::chrono::millise
   auto deadline = ComputeAlertableDeadline(timeout);
 
   while (true) {
+    // Snapshot before checking callbacks/object so a callback queued or the
+    // object signalled after these checks still wakes the block below.
+    uint64_t gen = g_wait_generation.load(std::memory_order_acquire);
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
+    }
+    auto result = TryConsume(posix_wait_handle->condition());
+    if (result != WaitResult::kTimeout) {
+      return result;
     }
     if (HasAlertableTimeoutElapsed(deadline)) {
       return WaitResult::kTimeout;
     }
-    auto result = posix_wait_handle->condition().Wait(ComputeAlertableWaitTimeout(deadline));
-    if (result != WaitResult::kTimeout) {
-      return result;
-    }
+    // Block until the object is signalled or a user callback is queued (both bump
+    // the generation), instead of re-polling on a 1ms slice.
+    WaitGlobalGeneration(gen, deadline);
   }
 }
 
@@ -1100,16 +1187,18 @@ WaitResult SignalAndWait(WaitHandle* wait_handle_to_signal, WaitHandle* wait_han
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
   while (true) {
+    uint64_t gen = g_wait_generation.load(std::memory_order_acquire);
     if (DispatchCurrentThreadUserCallback()) {
       return WaitResult::kUserCallback;
+    }
+    result = TryConsume(posix_wait_handle_to_wait_on->condition());
+    if (result != WaitResult::kTimeout) {
+      return result;
     }
     if (HasAlertableTimeoutElapsed(deadline)) {
       return WaitResult::kTimeout;
     }
-    result = posix_wait_handle_to_wait_on->condition().Wait(ComputeAlertableWaitTimeout(deadline));
-    if (result != WaitResult::kTimeout) {
-      return result;
-    }
+    WaitGlobalGeneration(gen, deadline);
   }
 }
 
@@ -1132,17 +1221,21 @@ std::pair<WaitResult, size_t> WaitMultiple(WaitHandle* wait_handles[], size_t wa
   ScopedAlertableState alertable_state_guard(true);
   auto deadline = ComputeAlertableDeadline(timeout);
   while (true) {
+    uint64_t gen = g_wait_generation.load(std::memory_order_acquire);
     if (DispatchCurrentThreadUserCallback()) {
       return std::make_pair(WaitResult::kUserCallback, 0);
+    }
+    // Non-blocking probe of the handle set (timeout 0); the outer loop keeps
+    // control so it can dispatch user callbacks between blocks.
+    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
+                                                   wait_all, std::chrono::milliseconds::zero());
+    if (result.first != WaitResult::kTimeout) {
+      return result;
     }
     if (HasAlertableTimeoutElapsed(deadline)) {
       return std::make_pair(WaitResult::kTimeout, 0);
     }
-    auto result = PosixConditionBase::WaitMultiple(std::vector<PosixConditionBase*>(conditions),
-                                                   wait_all, ComputeAlertableWaitTimeout(deadline));
-    if (result.first != WaitResult::kTimeout) {
-      return result;
-    }
+    WaitGlobalGeneration(gen, deadline);
   }
 }
 
@@ -1344,6 +1437,7 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
     thread->handle_.signaled_ = true;
     thread->handle_.cond_.notify_all();
   }
+  NotifyGlobalWaiters();  // wake multi-object/alertable waiters joining this thread
 
   current_thread_ = nullptr;
   current_thread_condition_ = nullptr;

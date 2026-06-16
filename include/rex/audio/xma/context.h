@@ -216,10 +216,16 @@ class XmaContext {
       work_completion_event_->Set();
     }
   }
-  void WaitForWorkDone() {
+  // Waits for the worker to finish a decode pass on this context. The timeout
+  // bounds the guest-thread stall so an XMA kick never blocks indefinitely on a
+  // synchronous FFmpeg decode; on timeout the game simply polls the context on a
+  // later read, as it would on real hardware.
+  rex::thread::WaitResult WaitForWorkDone(
+      std::chrono::milliseconds timeout = std::chrono::milliseconds::max()) {
     if (work_completion_event_) {
-      rex::thread::Wait(work_completion_event_.get(), false);
+      return rex::thread::Wait(work_completion_event_.get(), false, timeout);
     }
+    return rex::thread::WaitResult::kSuccess;
   }
 
  private:
@@ -259,6 +265,10 @@ class XmaContext {
   std::mutex lock_;
   std::atomic<bool> is_allocated_ = false;
   std::atomic<bool> is_enabled_ = false;
+  // Set by Disable() (XMADisableContext) without taking lock_, so a guest
+  // disable doesn't block on an in-progress decode. Work() polls it between
+  // frames and bails out early, shortening the decode critical section.
+  std::atomic<bool> disable_requested_ = false;
 
   // ffmpeg structures
   AVPacket* av_packet_ = nullptr;

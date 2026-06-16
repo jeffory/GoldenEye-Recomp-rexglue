@@ -67,9 +67,18 @@ class AndroidWindow final : public Window {
   // Painting only on request (not every tick) avoids contending with the GPU
   // command processor when there is no new guest output to show. Public wrapper
   // for the protected Window::OnPaint. Call only on the UI (loop) thread.
+  //
+  // force_paint=true: once our own paint_pending_ gate has decided to paint
+  // (the presenter requested it because the guest produced a new frame), the
+  // present must actually happen. The Android swapchain does not retain the
+  // previous frame's image across presents, so we must not let the present be
+  // skipped by Presenter::PaintFromUIThread's separate ui_thread_paint_requested_
+  // bookkeeping (which is a distinct atomic that may already have been consumed)
+  // - that would leave a stale/black frame and trigger reconnect churn. The
+  // paint_pending_ gate is the authoritative "a frame is waiting" signal here.
   void PaintFromUiThreadIfRequested() {
     if (paint_pending_.exchange(false, std::memory_order_acquire)) {
-      OnPaint(false);
+      OnPaint(true);
     }
   }
 
@@ -87,7 +96,7 @@ class AndroidWindow final : public Window {
   // do NOT paint before the first guest output exists - a premature paint
   // acquires the swapchain image and vsync-waits while holding the queue lock,
   // blocking the command processor's first swap (stall at present#1).
-  std::atomic<bool> paint_pending_{true};
+  std::atomic<bool> paint_pending_{false};
 };
 
 }  // namespace ui

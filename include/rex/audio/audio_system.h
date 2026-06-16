@@ -12,6 +12,7 @@
 #pragma once
 
 #include <atomic>
+#include <mutex>
 #include <queue>
 
 #include <rex/kernel.h>
@@ -77,6 +78,13 @@ class AudioSystem : public system::IAudioSystem {
   system::object_ref<system::XHostThread> worker_thread_;
 
   rex::thread::global_critical_region global_critical_region_;
+  // Dedicated lock for the client table. The audio render/submit path runs once
+  // per audio frame and used to take the process-wide global_critical_region_,
+  // contending with the render/frame/texture path that needs the same mutex.
+  // This lighter per-system mutex keeps audio's client bookkeeping off the
+  // global lock entirely; clients_ is private to AudioSystem so nothing outside
+  // it needs the global lock to observe the table consistently.
+  std::mutex clients_mutex_;
   static const size_t kMaximumClientCount = 8;
   struct {
     AudioDriver* driver;
