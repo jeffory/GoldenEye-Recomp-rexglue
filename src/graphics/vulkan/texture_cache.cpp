@@ -1593,6 +1593,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
     uint32_t level_array_slice_stride_bytes_scaled =
         level_guest_layout.array_slice_stride_bytes *
         (texture_resolution_scale_x * texture_resolution_scale_y);
+    command_processor_.SubmitBarriers(true);
     for (uint32_t slice = 0; slice < array_size; ++slice) {
       if (slice != 0) {
         command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -1604,7 +1605,6 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                           sizeof(load_constants.host_offset),
                                           &load_constants.host_offset);
       }
-      command_processor_.SubmitBarriers(true);
       command_buffer.CmdVkDispatch(group_count_x, group_count_y, load_constants.size_blocks[2]);
       load_constants.guest_offset += level_array_slice_stride_bytes_scaled;
       load_constants.host_offset += uint32_t(level_host_layout.slice_size_bytes);
@@ -1693,6 +1693,7 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                         &load_constants_float_convert);
 
       uint32_t level_array_slice_stride_bytes = uint32_t(level_host_layout.slice_size_bytes);
+      command_processor_.SubmitBarriers(true);
       for (uint32_t slice = 0; slice < array_size; ++slice) {
         if (slice != 0) {
           command_buffer.CmdVkPushConstants(load_pipeline_layout_, VK_SHADER_STAGE_COMPUTE_BIT,
@@ -1704,7 +1705,6 @@ bool VulkanTextureCache::LoadTextureDataFromResidentMemoryImpl(Texture& texture,
                                             sizeof(load_constants_float_convert.host_offset),
                                             &load_constants_float_convert.host_offset);
         }
-        command_processor_.SubmitBarriers(true);
         command_buffer.CmdVkDispatch(group_count_x, group_count_y,
                                      load_constants_float_convert.size_blocks[2]);
         load_constants_float_convert.guest_offset += level_array_slice_stride_bytes;
