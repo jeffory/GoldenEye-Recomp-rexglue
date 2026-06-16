@@ -114,14 +114,24 @@ bool VulkanSharedMemory::Initialize() {
     }
     VkMemoryRequirements buffer_memory_requirements;
     dfn.vkGetBufferMemoryRequirements(device, buffer_, &buffer_memory_requirements);
-    if (!rex::bit_scan_forward(
-            buffer_memory_requirements.memoryTypeBits & vulkan_device->memory_types().device_local,
-            &buffer_memory_type_)) {
-      REXGPU_ERROR(
-          "Shared memory: Failed to get a device-local Vulkan memory type for "
-          "the buffer");
-      Shutdown();
-      return false;
+    {
+      const ui::vulkan::VulkanDevice::MemoryTypes& mem_types = vulkan_device->memory_types();
+      // Prefer a UMA memory type (DEVICE_LOCAL + HOST_VISIBLE) so uploads can
+      // skip the staging buffer entirely.  Fall back to pure DEVICE_LOCAL.
+      uint32_t uma_bits = buffer_memory_requirements.memoryTypeBits
+                          & mem_types.device_local & mem_types.host_visible;
+      if (rex::bit_scan_forward(uma_bits, &buffer_memory_type_)) {
+        is_uma_ = true;
+        REXGPU_INFO("Shared memory: UMA device detected - direct host upload path enabled");
+      } else if (!rex::bit_scan_forward(
+                     buffer_memory_requirements.memoryTypeBits & mem_types.device_local,
+                     &buffer_memory_type_)) {
+        REXGPU_ERROR(
+            "Shared memory: Failed to get a device-local Vulkan memory type for "
+            "the buffer");
+        Shutdown();
+        return false;
+      }
     }
     VkMemoryAllocateInfo buffer_memory_allocate_info;
     VkMemoryAllocateInfo* buffer_memory_allocate_info_last = &buffer_memory_allocate_info;
@@ -151,10 +161,19 @@ bool VulkanSharedMemory::Initialize() {
       return false;
     }
     buffer_memory_.push_back(buffer_memory);
+    buffer_memory_size_ = buffer_memory_requirements.size;
     if (dfn.vkBindBufferMemory(device, buffer_, buffer_memory, 0) != VK_SUCCESS) {
       REXGPU_ERROR("Shared memory: Failed to bind memory to the Vulkan buffer");
       Shutdown();
       return false;
+    }
+    if (is_uma_) {
+      if (dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0,
+                          &buffer_host_mapping_) != VK_SUCCESS) {
+        REXGPU_ERROR("Shared memory: Failed to map UMA buffer for direct upload");
+        Shutdown();
+        return false;
+      }
     }
   }
 
@@ -162,10 +181,12 @@ bool VulkanSharedMemory::Initialize() {
   last_usage_ = Usage::kTransferDestination;
   last_written_range_ = std::make_pair<uint32_t, uint32_t>(0, 0);
 
-  upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
-      vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
-      rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
-                                                                           << page_size_log2()));
+  if (!is_uma_) {
+    upload_buffer_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+        vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+        rex::align(ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize, size_t(1)
+                                                                             << page_size_log2()));
+  }
 
   return true;
 }
@@ -180,6 +201,10 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
   const VkDevice device = vulkan_device->device();
 
   ui::vulkan::util::DestroyAndNullHandle(dfn.vkDestroyBuffer, device, buffer_);
+  if (buffer_host_mapping_ && !buffer_memory_.empty()) {
+    dfn.vkUnmapMemory(device, buffer_memory_[0]);
+    buffer_host_mapping_ = nullptr;
+  }
   for (VkDeviceMemory memory : buffer_memory_) {
     dfn.vkFreeMemory(device, memory, nullptr);
   }
@@ -193,11 +218,15 @@ void VulkanSharedMemory::Shutdown(bool from_destructor) {
 }
 
 void VulkanSharedMemory::CompletedSubmissionUpdated() {
-  upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+  if (upload_buffer_pool_) {
+    upload_buffer_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+  }
 }
 
 void VulkanSharedMemory::EndSubmission() {
-  upload_buffer_pool_->FlushWrites();
+  if (upload_buffer_pool_) {
+    upload_buffer_pool_->FlushWrites();
+  }
 }
 
 void VulkanSharedMemory::Use(Usage usage, std::pair<uint32_t, uint32_t> written_range) {
@@ -345,6 +374,53 @@ bool VulkanSharedMemory::UploadRanges(
   if (upload_page_ranges.empty()) {
     return true;
   }
+
+  // UMA fast path: skip staging buffer and write directly into the
+  // device-local host-visible buffer in a single memcpy per range.
+  if (is_uma_) {
+    const uint32_t range_start =
+        upload_page_ranges.front().first << page_size_log2();
+    const uint32_t range_size =
+        (upload_page_ranges.back().first + upload_page_ranges.back().second
+         - upload_page_ranges.front().first)
+        << page_size_log2();
+
+    // Ensure previous GPU reads of the buffer complete before host writes.
+    Use(Usage::kTransferDestination, std::make_pair(range_start, range_size));
+    command_processor_.SubmitBarriers(true);
+
+    auto* dst_base = static_cast<uint8_t*>(buffer_host_mapping_);
+    for (auto upload_range : upload_page_ranges) {
+      const uint32_t offset = upload_range.first << page_size_log2();
+      const uint32_t size = upload_range.second << page_size_log2();
+      trace_writer_.WriteMemoryRead(offset, size);
+      MakeRangeValid(offset, size, false);
+      std::memcpy(dst_base + offset, memory().TranslatePhysical(offset), size);
+    }
+
+    // Flush so the device sees the writes (no-op for coherent memory types).
+    const ui::vulkan::VulkanDevice* const vulkan_device =
+        command_processor_.GetVulkanDevice();
+    ui::vulkan::util::FlushMappedMemoryRange(vulkan_device, buffer_memory_[0],
+                                             buffer_memory_type_,
+                                             VkDeviceSize(range_start),
+                                             buffer_memory_size_,
+                                             VkDeviceSize(range_size));
+
+    // Make host writes available to all GPU read stages.
+    command_processor_.PushBufferMemoryBarrier(
+        buffer_, VkDeviceSize(range_start), VkDeviceSize(range_size),
+        VK_PIPELINE_STAGE_HOST_BIT,
+        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | guest_shader_pipeline_stages_ |
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+        VK_ACCESS_HOST_WRITE_BIT,
+        VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT,
+        VK_QUEUE_FAMILY_IGNORED, VK_QUEUE_FAMILY_IGNORED, false);
+    last_usage_ = Usage::kRead;
+    last_written_range_ = {0, 0};
+    return true;
+  }
+
   // upload_page_ranges are sorted, use them to determine the range for the
   // ordering barrier.
   Use(Usage::kTransferDestination,
