@@ -3,11 +3,18 @@
 > [!NOTE]
 > **This is a modified fork of [rexglue-sdk](https://github.com/rexglue/rexglue-sdk)**
 > (by ReXGlue, BSD-3-Clause) carrying the changes used by the
-> **[GoldenEye 007 recompilation](https://github.com/SunJaycy/GoldenEye-Recomp)** —
+> **[GoldenEye 007 recompilation](https://github.com/jeffory/GoldenEye-Recomp)** —
 > GPU/sync + render-target/EDRAM fixes, an online-multiplayer seam
-> (`src/kernel/xam/ge_online.*`), a colour-grade post-FX shader, and related
-> tweaks. All upstream credit and the BSD-3 license are retained. Build the
-> recomp against this checkout (`-DREXSDK_DIR=`). The original README follows.
+> (`src/kernel/xam/ge_online.*`), a colour-grade post-FX shader, a **POSIX /
+> Android port** (Linux + Android `arm64-v8a`: mmap guest memory, POSIX
+> threads/fibers, AAudio, NativeActivity surface), and related tweaks. All upstream
+> credit and the BSD-3 license are retained. Build the recomp against this checkout
+> (`-DREXSDK_DIR=`). The original README follows.
+>
+> **Fork CI** — [`.github/workflows/build.yml`](.github/workflows/build.yml) builds
+> the runtime with Clang on **Linux** (libc++) and **Windows** (MSVC), and
+> cross-builds the `rexruntime` shared library for **Android arm64-v8a** with the
+> NDK (r27), uploading each as a build artifact.
 
 ---
 
