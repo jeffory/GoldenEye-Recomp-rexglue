@@ -311,6 +311,12 @@ class Window {
   // the cursor instantly.
   void SetCursorVisibility(CursorVisibility new_cursor_visibility);
 
+  // Warp the OS cursor to a point in the window's client (logical) coordinate
+  // space - the same space mouse move events are reported in. Used by relative
+  // mouse-look to re-center the pointer each frame so it never reaches a screen
+  // edge. No-op on backends that don't implement it.
+  void WarpMouseToClient(int32_t client_x, int32_t client_y);
+
   bool HasFocus() const { return HasActualState() ? has_focus_ : false; }
   // May be applied in a delayed way or dropped at all, HasFocus will not
   // necessarily be true immediately.
@@ -517,6 +523,12 @@ class Window {
   virtual void ApplyNewMouseRelease() {}
   virtual void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
     (void)old_cursor_visibility;
+  }
+  // Warp the OS cursor to (client_x, client_y) in client/logical coordinates.
+  // Default no-op; implemented by backends that support relative mouse-look.
+  virtual void ApplyWarpMouseToClient(int32_t client_x, int32_t client_y) {
+    (void)client_x;
+    (void)client_y;
   }
   // If state can be applied, this is called to request bringing the window into
   // focus (and once that's done by the OS, update the actual focus state). Does

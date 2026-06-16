@@ -61,6 +61,7 @@ class Win32Window : public Window {
   void ApplyNewMouseCapture() override;
   void ApplyNewMouseRelease() override;
   void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
+  void ApplyWarpMouseToClient(int32_t client_x, int32_t client_y) override;
   void FocusImpl() override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
