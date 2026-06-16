@@ -446,6 +446,9 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DisableHostOcclusionQueries();
   uint64_t NormalizeOcclusionSamples(uint64_t samples) const;
   void WriteGuestOcclusionResult(uint32_t sample_count_address, uint64_t samples);
+  // Reads back occlusion-query results for any deferred queries whose submission
+  // has already completed on the GPU. Never blocks (polls fences only).
+  void ResolveCompletedOcclusionQueries();
   void InvalidateAllVertexBufferResidency();
   void InvalidateVertexBufferResidency(uint32_t vfetch_index);
   void InvalidateVertexBufferResidencyRange(uint32_t first_vfetch, uint32_t last_vfetch);
@@ -747,6 +750,23 @@ class VulkanCommandProcessor : public CommandProcessor {
     uint32_t host_index = UINT32_MAX;
     bool valid = false;
   } active_occlusion_query_;
+  // Occlusion-query results are read back from an already-completed submission
+  // instead of draining the GPU inline (which discards in-flight tile work on
+  // mobile tilers). EndGuestOcclusionQuery queues the host->readback copy in the
+  // current submission and records it here; the result is consumed on a later
+  // frame once the submission's fence has signalled.
+  struct PendingOcclusionResolve {
+    uint32_t sample_count_address = 0;
+    uint32_t host_index = UINT32_MAX;
+    uint64_t submission_index = 0;
+  };
+  std::deque<PendingOcclusionResolve> pending_occlusion_resolves_;
+  // Last result read back per guest sample-count target, used to give the guest
+  // a plausible value synchronously while the real (deferred) result is pending.
+  std::unordered_map<uint32_t, uint64_t> occlusion_last_results_;
+  // Backstop: if submissions stop completing, force a sync resolve rather than
+  // letting the deferral queue (and host query-pool slots) grow without bound.
+  static constexpr size_t kMaxPendingOcclusionResolves = 1024;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
@@ -835,6 +855,20 @@ class VulkanCommandProcessor : public CommandProcessor {
   static_assert(SpirvShaderTranslator::kDescriptorSetCount <=
                     sizeof(current_graphics_descriptor_sets_bound_up_to_date_) * CHAR_BIT,
                 "Bit fields storing descriptor set validity must be large enough");
+
+  // Cache enabling reuse of the texture+sampler descriptor set across draws when
+  // the resolved bindings are byte-for-byte unchanged (see UpdateBindings). Only
+  // valid within the frame it was written (transient sets are recycled per
+  // frame) and for the recorded pipeline layout.
+  struct TextureDescriptorSetReuse {
+    uint64_t hash = 0;
+    VkDescriptorSet descriptor_set = VK_NULL_HANDLE;
+    uint64_t frame = 0;
+    const PipelineLayout* pipeline_layout = nullptr;
+    bool valid = false;
+  };
+  TextureDescriptorSetReuse texture_descriptor_set_reuse_vertex_;
+  TextureDescriptorSetReuse texture_descriptor_set_reuse_pixel_;
 
   // Float constant usage masks of the last draw call.
   uint64_t current_float_constant_map_vertex_[4];
