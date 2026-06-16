@@ -44,6 +44,7 @@ class MnkInputDriver final : public InputDriver,
   void OnMouseDown(rex::ui::MouseEvent& e) override;
   void OnMouseUp(rex::ui::MouseEvent& e) override;
   void OnMouseMove(rex::ui::MouseEvent& e) override;
+  void OnMouseWheel(rex::ui::MouseEvent& e) override;
 
   // WindowListener
   void OnClosing(rex::ui::UIEvent& e) override;
@@ -70,6 +71,11 @@ class MnkInputDriver final : public InputDriver,
   int32_t prev_mouse_y_ = 0;
   bool mouse_captured_ = false;
   bool has_focus_ = true;
+
+  // Mouse-wheel detents are momentary (no key-up), so they are held asserted
+  // for a few frames via these countdowns, decremented each GetState().
+  int32_t wheel_up_frames_ = 0;
+  int32_t wheel_down_frames_ = 0;
 
   // Keystroke queue
   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;

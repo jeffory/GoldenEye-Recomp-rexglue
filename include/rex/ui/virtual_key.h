@@ -97,6 +97,12 @@ enum class VirtualKey : uint16_t {
   k8 = 0x38,
   k9 = 0x39,
 
+  // Synthetic codes (not real Windows VKs) for mouse-wheel detents, placed in
+  // the unassigned 0x3A-0x40 VK gap so they can flow through the same keybind
+  // path as keys/buttons. The mouse wheel produces no native virtual key.
+  kMouseWheelUp = 0x3A,
+  kMouseWheelDown = 0x3B,
+
   // Same as ASCII 'A' - 'Z'.
   kA = 0x41,
   kB = 0x42,

@@ -29,6 +29,9 @@ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity_y, 0.0, "Input",
                       "Separate vertical mouse sensitivity (0 = use mnk_sensitivity)")
     .range(0.0, 10.0);
 REXCVAR_DEFINE_BOOL(mnk_invert_y, false, "Input", "Invert vertical mouse-look");
+REXCVAR_DEFINE_INT32(mnk_wheel_pulse_frames, 2, "Input",
+                     "Frames a mouse-wheel detent stays asserted as a button press")
+    .range(1, 30);
 
 REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button");
 REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
@@ -150,6 +153,15 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
   }
 
   std::lock_guard lock(state_mutex_);
+
+  // Reflect any pending wheel detents as held keys for this poll, then count
+  // the frame down so a single detent registers as a short button press.
+  key_down_[static_cast<uint16_t>(VirtualKey::kMouseWheelUp)] = wheel_up_frames_ > 0;
+  key_down_[static_cast<uint16_t>(VirtualKey::kMouseWheelDown)] = wheel_down_frames_ > 0;
+  if (wheel_up_frames_ > 0)
+    --wheel_up_frames_;
+  if (wheel_down_frames_ > 0)
+    --wheel_down_frames_;
 
   uint16_t buttons = 0;
   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
@@ -333,6 +345,12 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), true);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), true);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), true);
+      break;
     default:
       break;
   }
@@ -352,9 +370,27 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
     case rex::ui::MouseEvent::Button::kMiddle:
       SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
       break;
+    case rex::ui::MouseEvent::Button::kX1:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton1), false);
+      break;
+    case rex::ui::MouseEvent::Button::kX2:
+      SetKeyState(static_cast<uint16_t>(VirtualKey::kXButton2), false);
+      break;
     default:
       break;
   }
+}
+
+void MnkInputDriver::OnMouseWheel(rex::ui::MouseEvent& e) {
+  if (!IsEnabled() || !has_focus_)
+    return;
+  std::lock_guard lock(state_mutex_);
+  // scroll_y is positive when scrolling up/away from the user.
+  int32_t pulse = REXCVAR_GET(mnk_wheel_pulse_frames);
+  if (e.scroll_y() > 0)
+    wheel_up_frames_ = pulse;
+  else if (e.scroll_y() < 0)
+    wheel_down_frames_ = pulse;
 }
 
 void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
@@ -375,6 +411,8 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
   std::memset(key_down_, 0, sizeof(key_down_));
   mouse_dx_ = 0;
   mouse_dy_ = 0;
+  wheel_up_frames_ = 0;
+  wheel_down_frames_ = 0;
   if (mouse_captured_ && attached_window_) {
     mouse_captured_ = false;
     attached_window_->SetCursorVisibility(rex::ui::Window::CursorVisibility::kVisible);
