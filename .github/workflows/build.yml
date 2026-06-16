@@ -35,15 +35,16 @@ jobs:
 
       - uses: lukka/get-cmake@latest
 
-      # The SDK targets libc++ on Unix (it force-adds -fexperimental-library for
-      # std::jthread/stop_token, and uses std::expected). Build against libc++.
+      # Build against libc++: ubuntu's clang+libstdc++ lacks std::expected, and
+      # libc++ gates std::jthread/stop_token behind -fexperimental-library (the
+      # same flag the CMake already applies on Android/libc++).
       - name: Configure
         run: >
           cmake --preset linux-amd64
-          -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -stdlib=libc++"
-          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++"
-          -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++"
-          -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++"
+          -DCMAKE_CXX_FLAGS="-march=x86-64-v3 -stdlib=libc++ -fexperimental-library"
+          -DCMAKE_EXE_LINKER_FLAGS="-stdlib=libc++ -fexperimental-library"
+          -DCMAKE_SHARED_LINKER_FLAGS="-stdlib=libc++ -fexperimental-library"
+          -DCMAKE_MODULE_LINKER_FLAGS="-stdlib=libc++ -fexperimental-library"
 
       - name: Build (Release)
         run: cmake --build --preset linux-amd64-release
@@ -116,7 +117,7 @@ jobs:
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
-          local-cache: true
+          local-cache: false
 
       - name: Configure (arm64-v8a)
         env:
