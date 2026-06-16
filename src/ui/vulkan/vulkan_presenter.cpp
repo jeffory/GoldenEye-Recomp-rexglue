@@ -55,6 +55,14 @@ REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_mailbox, true, "UI/Vulkan",
 REXCVAR_DEFINE_BOOL(vulkan_allow_present_mode_fifo_relaxed, true, "UI/Vulkan",
                     "Allow FIFO relaxed present mode");
 
+// On fixed-refresh displays (mobile/Android) IMMEDIATE just tears with no benefit.
+// Default true on Android so MAILBOX is tried before IMMEDIATE; set false to restore
+// desktop priority (IMMEDIATE first for VRR support).
+REXCVAR_DEFINE_BOOL(vulkan_prefer_present_mode_mailbox_first, REX_PLATFORM_ANDROID, "UI/Vulkan",
+                    "Prefer MAILBOX over IMMEDIATE present mode. Defaults to true on Android "
+                    "(fixed-refresh, no VRR benefit from tearing), false on desktop. IMMEDIATE "
+                    "is only used as a last resort when this is true.");
+
 namespace rex {
 namespace ui {
 namespace vulkan {
@@ -1288,8 +1296,12 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
   swapchain_create_info.pNext = nullptr;
   swapchain_create_info.flags = 0;
   swapchain_create_info.surface = surface;
+  // Triple-buffer minimum: at least 3 images so acquire never stalls on a 2-image chain.
+  // kSubmissionCount is already 3, but state the floor explicitly so the swapchain
+  // image count remains ≥3 even if the submission pipeline depth is ever adjusted.
+  static constexpr uint32_t kMinSwapchainImages = 3;
   swapchain_create_info.minImageCount =
-      std::max(kSubmissionCount, surface_capabilities.minImageCount);
+      std::max({kMinSwapchainImages, kSubmissionCount, surface_capabilities.minImageCount});
   if (surface_capabilities.maxImageCount) {
     swapchain_create_info.minImageCount =
         std::min(swapchain_create_info.minImageCount, surface_capabilities.maxImageCount);
@@ -1342,31 +1354,35 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
     swapchain_create_info.compositeAlpha =
         VkCompositeAlphaFlagBitsKHR(uint32_t(1) << composite_alpha_shift);
   }
-  // As presentation is usually controlled by the GPU command processor, it's
-  // better to use modes that allow as quick acquisition as possible to avoid
-  // interfering with GPU command processing, and also to allow tearing so
-  // variable refresh rate may be used where it's available.
-  // Note: If the priorities here are changes, update the cvar descriptions.
-  if (REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+  // Present mode priority. Desktop default (mailbox_first=false): IMMEDIATE first so
+  // VRR displays can tear at will for minimum latency. Mobile default (mailbox_first=true,
+  // e.g. Android arm64 handhelds with fixed-refresh panels): MAILBOX first — tear-free and
+  // low-latency; IMMEDIATE is only tried as a last resort when explicitly allowed via cvar.
+  // Note: If the priorities here are changed, update the cvar descriptions.
+  const bool mailbox_first = REXCVAR_GET(vulkan_prefer_present_mode_mailbox_first);
+  if (!mailbox_first && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
       std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_IMMEDIATE_KHR) !=
           present_modes.cend()) {
-    // Allowing tearing to reduce latency, and possibly variable refresh rate
-    // (though on Windows with borderless fullscreen, GDI copying is used
-    // instead of independent flip, so it's not supported there).
+    // Desktop: tearing for VRR support and minimum latency.
+    // (On Windows borderless fullscreen GDI copying is used, so VRR may not activate there.)
     swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
   } else if (REXCVAR_GET(vulkan_allow_present_mode_mailbox) &&
              std::find(present_modes.cbegin(), present_modes.cend(), VK_PRESENT_MODE_MAILBOX_KHR) !=
                  present_modes.cend()) {
-    // Allowing dropping frames to reduce latency, but no tearing.
+    // Low latency, no tearing (mobile preferred, desktop second choice).
     swapchain_create_info.presentMode = VK_PRESENT_MODE_MAILBOX_KHR;
   } else if (REXCVAR_GET(vulkan_allow_present_mode_fifo_relaxed) &&
              std::find(present_modes.cbegin(), present_modes.cend(),
                        VK_PRESENT_MODE_FIFO_RELAXED_KHR) != present_modes.cend()) {
-    // Limiting the frame rate, but lets too long frames cause tearing not to
-    // make the latency even worse.
+    // Vsync with latency relief for frames that run long.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_RELAXED_KHR;
+  } else if (mailbox_first && REXCVAR_GET(vulkan_allow_present_mode_immediate) &&
+             std::find(present_modes.cbegin(), present_modes.cend(),
+                       VK_PRESENT_MODE_IMMEDIATE_KHR) != present_modes.cend()) {
+    // Mobile last resort: IMMEDIATE explicitly requested and no preferred mode available.
+    swapchain_create_info.presentMode = VK_PRESENT_MODE_IMMEDIATE_KHR;
   } else {
-    // Highest latency (but always guaranteed to be available).
+    // FIFO is always available and guaranteed by the Vulkan spec.
     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
   }
   swapchain_create_info.clipped = VK_TRUE;
