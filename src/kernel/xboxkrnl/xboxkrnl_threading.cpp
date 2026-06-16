@@ -864,12 +864,25 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
   //     WHOLE boot stalls before the first frame (intermittent ~50% black boot).
   //     Diagnosed via the infinite-wait tracer: a single stuck KeWaitForSingleObject
   //     on 0x8308EC24, gstart=0x82366628, identical on every black boot.
+  //
+  // The true root cause is a guest-algorithm race (the producer decides not to
+  // KeSetEvent because the 360 model assumed the consumer could not yet be
+  // waiting); the host event itself is signalled correctly whenever the guest
+  // *does* call KeSetEvent, so there is no host-side wakeup to recover and the
+  // guest hand-off lives in recompiled PPC outside this layer. We therefore keep
+  // the self-heal poll but cap it BELOW one 60Hz frame (was 30ms ~= 2 frames):
+  // in the common case the event is signalled every frame and the wait returns
+  // on signal long before the cap fires, so this costs nothing; only when a
+  // wakeup is genuinely lost does it fire, and then it recovers in under a frame
+  // instead of stalling for two. arm64 cost is negligible: at most these two
+  // threads re-check at ~12ms, and only while actually stuck.
+  static constexpr int64_t kLostWakeupSelfHealTimeout = -120000;  // -12ms (NT 100ns units)
   uint64_t capped_timeout;
   if (!timeout_ptr) {
     auto* cur = XThread::GetCurrentThread();
     uint32_t start = cur ? cur->creation_params()->start_address : 0u;
     if (start == 0x821A4A68u || start == 0x82366628u) {
-      capped_timeout = static_cast<uint64_t>(static_cast<int64_t>(-300000));  // -30ms (NT 100ns units)
+      capped_timeout = static_cast<uint64_t>(kLostWakeupSelfHealTimeout);
       timeout_ptr = &capped_timeout;
     }
   }
@@ -1009,14 +1022,53 @@ static void xeKfLowerIrql(PPCContext* ctx, unsigned char new_irql) {
   pcr->current_irql = new_irql;
 }
 
+// Arch-appropriate CPU relax hint for spin-wait loops. Unlike
+// rex::thread::MaybeYield() - which issues a sched_yield() syscall plus a full
+// memory barrier on EVERY iteration - this is a cheap pipeline hint with no
+// syscall and no barrier. On few-core arm64 handhelds the old
+// sched_yield-per-iteration loop was a syscall storm that could invert priority
+// and starve the very thread holding the lock; a bounded pause-backoff avoids
+// that flood.
+static inline void cpu_relax() {
+#if REX_ARCH_ARM64
+  __asm__ __volatile__("yield" ::: "memory");
+#elif REX_ARCH_AMD64
+  __asm__ __volatile__("pause" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
+// Guest spinlocks are held for only a handful of instructions, so the common
+// case is "contended for a few hundred cycles". Spin locally with an
+// exponentially growing pause budget first; only once that budget is exhausted
+// (the holder is likely descheduled) do we fall back to sched_yield so it can
+// run. The CAS below already carries the acquire barrier on success, so we no
+// longer emit a DMB ISH on every spin iteration the way MaybeYield() did.
+static constexpr uint32_t kSpinBackoffMaxShift = 6;        // cap pause burst at 1<<6 = 64
+static constexpr uint32_t kSpinBackoffYieldThreshold = 12;  // spins before falling back to yield
+
 // Guest-memory spinlock helpers - store PCR address as owner (matching xenia).
 // PPCContext* provides r13 (PCR address) without needing XThread::GetCurrentThread().
 uint32_t xeKeKfAcquireSpinLock(PPCContext* ctx, X_KSPINLOCK* lock, bool change_irql) {
   uint32_t old_irql = change_irql ? xeKfRaiseIrql(ctx, IRQL_DISPATCH) : 0;
   uint32_t pcr_addr = static_cast<uint32_t>(ctx->r13.u64);
-  assert_true(lock->prcb_of_owner != rex::byte_swap(pcr_addr));  // deadlock detection
-  while (!rex::thread::atomic_cas(0u, rex::byte_swap(pcr_addr), &lock->prcb_of_owner.value)) {
-    rex::thread::MaybeYield();
+  const uint32_t swapped_owner = rex::byte_swap(pcr_addr);
+  assert_true(lock->prcb_of_owner != swapped_owner);  // deadlock detection
+  uint32_t spins = 0;
+  while (!rex::thread::atomic_cas(0u, swapped_owner, &lock->prcb_of_owner.value)) {
+    if (spins < kSpinBackoffYieldThreshold) {
+      const uint32_t burst = 1u << std::min(spins, kSpinBackoffMaxShift);
+      for (uint32_t i = 0; i < burst; ++i) {
+        cpu_relax();
+      }
+      ++spins;
+    } else {
+      // Spin budget exhausted: the holder is probably not running. Yield the
+      // core to it instead of burning CPU, then resume cheap spinning.
+      rex::thread::MaybeYield();
+      spins = 0;
+    }
   }
   return old_irql;
 }
