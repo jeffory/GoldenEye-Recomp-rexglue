@@ -10,9 +10,13 @@
  */
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cinttypes>
 #include <cmath>
+#include <condition_variable>
 #include <cstring>
+#include <mutex>
 #include <string_view>
 
 #include <fmt/format.h>
@@ -37,15 +41,19 @@
 
 REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
 
-// GoldenEye GPU throttle. The game's GPU command-submit chain is self-feeding
-// (each command buffer's kickoff enqueues the next when replayed); under the
-// emulator the GPU side outruns the render thread, the kickoff fires with no
-// next buffer, the chain dies, and the screen freezes. Pausing the CP worker a
-// little after each ring drain holds the GPU back so the render stays ahead and
-// the chain survives. Tune live in the .toml (ge_gpu_throttle_us = N); 0 = off.
-REXCVAR_DEFINE_INT32(ge_gpu_throttle_us, 120, "GPU",
+// GoldenEye GPU throttle (legacy escape hatch, default OFF). Historically the
+// CP worker slept a fixed interval after every ring drain to hold the emulated
+// GPU back so the render thread stayed ahead. That unconditional sleep
+// rate-limited the very thread that must advance the swap counter / ring read
+// pointer to release the guest's GPU-completion wait, which on low-core arm64
+// handhelds turned into the sub-30fps stutter. The CP-progress handshake below
+// (ge_cp_signal_progress / rex_ge_cp_wait_progress) removes the need to throttle
+// at all, so the default is now 0. The cvar is kept only as a live-tunable
+// escape hatch (pause menu); when 0 the worker never sleeps while packets are
+// pending. Tune live in the .toml (ge_gpu_throttle_us = N); 0 = off (default).
+REXCVAR_DEFINE_INT32(ge_gpu_throttle_us, 0, "GPU",
                      "GoldenEye: microseconds to pause the CP worker after each ring drain so the "
-                     "emulated GPU cannot outrun the render thread (0 = off)")
+                     "emulated GPU cannot outrun the render thread (0 = off, default)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
 REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
@@ -111,6 +119,46 @@ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// GoldenEye CP-progress handshake.
+//
+// The guest's GPU-completion wait (ge_dbg_now, wrapper repo) used to busy-spin
+// with std::this_thread::yield() until this worker advanced the swap counter /
+// ring read pointer. On low-core arm64 handhelds dozens of yield-spinning guest
+// threads oversubscribed the cores and starved this very worker -- so the fence
+// never advanced and the spin never exited (the sub-30fps stutter / freeze).
+//
+// Now the worker bumps a sequence counter and signals a condition variable
+// every time it makes ring progress (after each drain), and the guest wait
+// blocks on it with a bounded timeout instead of spinning. Exposed via extern
+// "C" so the wrapper repo can wait without sharing a header. The waiter captures
+// the sequence before sampling CP state and passes it back, so progress between
+// its sample and its wait is not lost (the predicate re-checks under the lock).
+namespace {
+std::mutex ge_cp_progress_mutex;
+std::condition_variable ge_cp_progress_cv;
+std::atomic<uint64_t> ge_cp_progress_seq{0};
+
+inline void ge_cp_signal_progress() {
+  {
+    std::lock_guard<std::mutex> lock(ge_cp_progress_mutex);
+    ge_cp_progress_seq.fetch_add(1, std::memory_order_release);
+  }
+  ge_cp_progress_cv.notify_all();
+}
+}  // namespace
+
+extern "C" uint64_t rex_ge_cp_progress_seq() {
+  return ge_cp_progress_seq.load(std::memory_order_acquire);
+}
+
+extern "C" void rex_ge_cp_wait_progress(uint64_t last_seq, uint32_t timeout_us) {
+  std::unique_lock<std::mutex> lock(ge_cp_progress_mutex);
+  ge_cp_progress_cv.wait_for(
+      lock, std::chrono::microseconds(timeout_us),
+      [last_seq] { return ge_cp_progress_seq.load(std::memory_order_acquire) != last_seq; });
+}
 
 CommandProcessor::CommandProcessor(GraphicsSystem* graphics_system,
                                    system::KernelState* kernel_state)
@@ -333,9 +381,14 @@ void CommandProcessor::WorkerThreadMain() {
                                        read_ptr_index_);
     }
 
-    // GoldenEye GPU throttle: pause briefly after draining so the emulated GPU
-    // can't outrun the render thread (keeps the self-feeding GPU command chain
-    // alive -> no freeze). Tunable live via ge_gpu_throttle_us.
+    // GoldenEye CP-progress handshake: the ring read pointer / swap counter just
+    // advanced, so wake any guest GPU-completion wait blocked on real CP progress
+    // (rex_ge_cp_wait_progress) instead of leaving it to busy-spin.
+    ge_cp_signal_progress();
+
+    // GoldenEye GPU throttle (legacy escape hatch, default OFF -- see the cvar
+    // definition). The handshake above removes the need to throttle; only sleep
+    // here when explicitly enabled, never unconditionally while packets pend.
     int32_t ge_throttle_us = REXCVAR_GET(ge_gpu_throttle_us);
     if (ge_throttle_us > 0) {
       rex::thread::Sleep(std::chrono::microseconds(ge_throttle_us));
