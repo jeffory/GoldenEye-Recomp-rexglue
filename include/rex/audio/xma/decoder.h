@@ -85,6 +85,12 @@ class XmaDecoder {
   XmaContext contexts_[kContextCount];
   bit::BitMap context_bitmap_;
 
+  // Ids of contexts the guest just kicked. The worker drains and decodes these
+  // before its linear 0..kContextCount scan, so a kick doesn't wait behind
+  // unrelated contexts.
+  std::mutex kick_lock_;
+  std::queue<uint32_t> kicked_contexts_;
+
   uint32_t context_data_first_ptr_ = 0;
   uint32_t context_data_last_ptr_ = 0;
 };
