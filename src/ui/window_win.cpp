@@ -606,6 +606,15 @@ void Win32Window::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibilit
                                                                                      : nullptr);
 }
 
+void Win32Window::ApplyWarpMouseToClient(int32_t client_x, int32_t client_y) {
+  if (!hwnd_) {
+    return;
+  }
+  POINT pt = {static_cast<LONG>(client_x), static_cast<LONG>(client_y)};
+  ClientToScreen(hwnd_, &pt);
+  SetCursorPos(pt.x, pt.y);
+}
+
 void Win32Window::FocusImpl() {
   SetFocus(hwnd_);
 }

@@ -317,6 +317,10 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view tit
 
 GTKWindow::~GTKWindow() {
   EnterDestructor();
+  if (blank_cursor_) {
+    g_object_unref(blank_cursor_);
+    blank_cursor_ = nullptr;
+  }
   if (window_) {
     // Set window_ to null to ignore events from now on since this ui::GTKWindow
     // is entering an indeterminate state.
@@ -558,6 +562,78 @@ void GTKWindow::ApplyNewMainMenu(MenuItem* old_main_menu) {
 
 void GTKWindow::FocusImpl() {
   gtk_window_activate_focus(GTK_WINDOW(window_));
+}
+
+GdkWindow* GTKWindow::GetClientGdkWindow() const {
+  return drawing_area_ ? gtk_widget_get_window(drawing_area_) : nullptr;
+}
+
+GdkCursor* GTKWindow::EnsureBlankCursor() {
+  if (!blank_cursor_ && window_) {
+    GdkDisplay* display = gtk_widget_get_display(window_);
+    blank_cursor_ = gdk_cursor_new_for_display(display, GDK_BLANK_CURSOR);
+  }
+  return blank_cursor_;
+}
+
+void GTKWindow::ApplyNewMouseCapture() {
+  GdkWindow* gdk_window = GetClientGdkWindow();
+  if (!gdk_window) {
+    return;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  GdkSeat* seat = gdk_display_get_default_seat(display);
+  // Hide the cursor while grabbed if the desired visibility is non-visible.
+  GdkCursor* cursor =
+      GetCursorVisibility() == CursorVisibility::kVisible ? nullptr : EnsureBlankCursor();
+  // owner_events = TRUE so the drawing area still receives motion events for
+  // delta tracking while the pointer is confined to the window.
+  if (gdk_seat_grab(seat, gdk_window, GDK_SEAT_CAPABILITY_ALL_POINTING, TRUE, cursor, nullptr,
+                    nullptr, nullptr) == GDK_GRAB_SUCCESS) {
+    pointer_grabbed_ = true;
+  }
+}
+
+void GTKWindow::ApplyNewMouseRelease() {
+  if (!pointer_grabbed_ || !window_) {
+    return;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  GdkSeat* seat = gdk_display_get_default_seat(display);
+  gdk_seat_ungrab(seat);
+  pointer_grabbed_ = false;
+}
+
+void GTKWindow::ApplyNewCursorVisibility(CursorVisibility /*old_cursor_visibility*/) {
+  GdkWindow* gdk_window = GetClientGdkWindow();
+  if (!gdk_window) {
+    return;
+  }
+  if (GetCursorVisibility() == CursorVisibility::kVisible) {
+    gdk_window_set_cursor(gdk_window, nullptr);
+  } else {
+    gdk_window_set_cursor(gdk_window, EnsureBlankCursor());
+  }
+}
+
+void GTKWindow::ApplyWarpMouseToClient(int32_t client_x, int32_t client_y) {
+  GdkWindow* gdk_window = GetClientGdkWindow();
+  if (!gdk_window || !window_) {
+    return;
+  }
+  GdkDisplay* display = gtk_widget_get_display(window_);
+  GdkScreen* screen = gdk_display_get_default_screen(display);
+  GdkSeat* seat = gdk_display_get_default_seat(display);
+  GdkDevice* pointer = gdk_seat_get_pointer(seat);
+  if (!pointer) {
+    return;
+  }
+  // Mouse events are reported in coordinates relative to the drawing area's
+  // GdkWindow; convert the client point to root coordinates for the warp.
+  gint origin_x = 0;
+  gint origin_y = 0;
+  gdk_window_get_origin(gdk_window, &origin_x, &origin_y);
+  gdk_device_warp(pointer, screen, origin_x + client_x, origin_y + client_y);
 }
 
 std::unique_ptr<Surface> GTKWindow::CreateSurfaceImpl(Surface::TypeFlags allowed_types) {

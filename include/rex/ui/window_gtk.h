@@ -44,7 +44,12 @@ class GTKWindow : public Window {
   void ApplyNewFullscreen() override;
   void ApplyNewTitle() override;
   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
-  // Mouse capture seems to happen implicitly compared to Windows.
+  // Relative mouse-look support: grab/ungrab the pointer, hide the cursor, and
+  // warp it back to the client area each frame so it never reaches a screen edge.
+  void ApplyNewMouseCapture() override;
+  void ApplyNewMouseRelease() override;
+  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
+  void ApplyWarpMouseToClient(int32_t client_x, int32_t client_y) override;
   void FocusImpl() override;
 
   std::unique_ptr<Surface> CreateSurfaceImpl(Surface::TypeFlags allowed_types) override;
@@ -71,10 +76,21 @@ class GTKWindow : public Window {
                                                gpointer user_data);
   static gboolean DrawHandler(GtkWidget* widget, cairo_t* cr, gpointer data);
 
+  // The GdkWindow that mouse events are reported relative to (the drawing area),
+  // or null if not yet realized.
+  GdkWindow* GetClientGdkWindow() const;
+  // Lazily create the all-transparent cursor used to hide the pointer.
+  GdkCursor* EnsureBlankCursor();
+
   // Non-owning (initially floating) references to the widgets.
   GtkWidget* window_ = nullptr;
   GtkWidget* box_ = nullptr;
   GtkWidget* drawing_area_ = nullptr;
+
+  // Owned blank cursor for hiding the pointer during mouse-look (unref in dtor).
+  GdkCursor* blank_cursor_ = nullptr;
+  // Whether the pointer is currently grabbed via the GdkSeat.
+  bool pointer_grabbed_ = false;
 
   uint32_t batched_size_update_depth_ = 0;
   bool batched_size_update_contained_configure_ = false;

@@ -405,6 +405,17 @@ void Window::SetCursorVisibility(CursorVisibility new_cursor_visibility) {
   }
 }
 
+void Window::WarpMouseToClient(int32_t client_x, int32_t client_y) {
+  if (!CanApplyState()) {
+    return;
+  }
+  WindowDestructionReceiver destruction_receiver(this);
+  ApplyWarpMouseToClient(client_x, client_y);
+  if (destruction_receiver.IsWindowDestroyedOrStateInapplicable()) {
+    return;
+  }
+}
+
 void Window::Focus() {
   if (!CanApplyState() || has_focus_) {
     return;
