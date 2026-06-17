@@ -196,8 +196,18 @@ bool CommandProcessor::Initialize() {
   }
 
   worker_running_ = true;
+  // creation_flags 0x20 => start this host thread at kAboveNormal priority. The
+  // CP worker is the single thread that drains the ring / advances the swap
+  // counter; on low-core arm64 handhelds the guest's GPU-completion yield-spin
+  // (dozens of guest threads) used to starve it, which is exactly why ge_dbg_now
+  // had to block on rex_ge_cp_wait_progress instead of yielding. Boosting the
+  // worker above the guest workers keeps it scheduled so the yield path (the one
+  // proven good on desktop) no longer starves it -- removing the need for the
+  // freeze-prone blocking wait. The creation-flags priority path
+  // (XThread::Create, creation_flags & 0x60) is applied even when the
+  // ignore_thread_priorities cvar is set (which neuters XThread::SetPriority).
   worker_thread_ = system::object_ref<system::XHostThread>(
-      new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+      new system::XHostThread(kernel_state_, 128 * 1024, /*creation_flags=*/0x20, [this]() {
         WorkerThreadMain();
         return 0;
       }));
