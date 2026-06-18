@@ -475,8 +475,14 @@ void ReXApp::OnDestroy() {
     window_->RemoveInputListener(this);
     window_->RemoveListener(this);
   }
-  window_.reset();
+  // Tear down the runtime (and the input system it owns) BEFORE the window.
+  // Input drivers hold a non-owning attached_window_ pointer and detach
+  // themselves in their destructors via window_->RemoveInputListener(); since
+  // Window::~Window does not fire OnClosing, that pointer is only cleaned up in
+  // the driver destructor. Destroying window_ first would leave it dangling and
+  // crash in std::_Rb_tree_decrement walking the freed input_listeners_ map.
   runtime_.reset();
+  window_.reset();
 }
 
 void ReXApp::SetGuestFrameStats(ui::DebugOverlayDialog::FrameStatsProvider provider) {
