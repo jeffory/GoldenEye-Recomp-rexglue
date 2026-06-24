@@ -336,6 +336,13 @@ void CommandProcessor::WorkerThreadMain() {
     return;
   }
 
+  // arm64 big.LITTLE: this host worker drains the GPU command ring and advances
+  // the swap counter / ring read pointer that releases the guest's GPU wait, so
+  // it gates frame throughput just like the guest hot threads. Pin it to the big
+  // cluster (self-target, on-thread) with the same bounded, preemptible policy.
+  // No-op off Android / on non-big.LITTLE parts / when the cvar is disabled.
+  rex::thread::PinCurrentThreadToBigCluster("CP host worker (GPU Commands)");
+
   while (worker_running_) {
     while (!pending_fns_.empty()) {
       auto fn = std::move(pending_fns_.front());

@@ -15,18 +15,23 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <atomic>
 #include <array>
+#include <algorithm>
 #include <cerrno>
 #include <condition_variable>
 #include <cstddef>
+#include <cstdio>
+#include <cstdlib>
 #include <ctime>
 #include <deque>
 #include <limits>
 #include <memory>
 #include <mutex>
 
+#include <fcntl.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <sys/eventfd.h>
+#include <sys/resource.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -34,6 +39,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 
 #include <rex/assert.h>
 #include <rex/chrono/chrono_steady_cast.h>
+#include <rex/cvar.h>
 #include <rex/logging.h>
 #include <rex/thread/timer_queue.h>
 
@@ -61,6 +67,11 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
 #else
 #define REX_HAS_SIGEV_THREAD_ID 0
 #endif
+
+// big.LITTLE hot-thread pinning escape hatch, defined in threading.cpp. Declared
+// at global scope (outside the namespace) so the unqualified REXCVAR_GET below
+// resolves to the single global storage accessor, matching the audio driver.
+REXCVAR_DECLARE(bool, android_pin_hot_threads);
 
 namespace rex::thread {
 
@@ -146,6 +157,143 @@ void install_signal_handler(SignalType type) {
 
 // TODO(dougvj)
 void EnableAffinityConfiguration() {}
+
+// --- big.LITTLE hot-thread scheduling ----------------------------------------
+// See <rex/thread.h> for the contract. Real only on Android; non-Android POSIX
+// hosts (desktop Linux / mac) are not the target and report "unavailable".
+
+#if REX_PLATFORM_ANDROID
+namespace {
+
+// Reads a single unsigned integer from a sysfs file. Returns 0 on any failure
+// (file absent, unreadable, or empty) so callers can treat 0 as "unknown".
+uint64_t ReadSysfsU64(const char* path) {
+  int fd = open(path, O_RDONLY | O_CLOEXEC);
+  if (fd < 0) {
+    return 0;
+  }
+  char buf[32] = {};
+  ssize_t n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    return 0;
+  }
+  return strtoull(buf, nullptr, 10);
+}
+
+// Detect the big-cluster CPU mask once. A core is "big" if its max cpufreq (or,
+// where cpufreq is unreadable, its scheduler-reported capacity) sits in the top
+// tier. Returns 0 when the topology is flat (not big.LITTLE), too small to pin
+// without serializing the runtime, or simply unreadable -> caller does no pin.
+uint64_t DetectBigClusterMask() {
+  const long ncpu = sysconf(_SC_NPROCESSORS_CONF);
+  if (ncpu < 2 || ncpu > 64) {
+    return 0;
+  }
+
+  uint64_t metric[64] = {};
+  uint64_t highest = 0;
+  bool any = false;
+  for (long c = 0; c < ncpu; ++c) {
+    char path[128];
+    std::snprintf(path, sizeof(path),
+                  "/sys/devices/system/cpu/cpu%ld/cpufreq/cpuinfo_max_freq", c);
+    uint64_t v = ReadSysfsU64(path);
+    if (!v) {
+      // Fall back to the scheduler's capacity model when cpufreq is gated off.
+      std::snprintf(path, sizeof(path), "/sys/devices/system/cpu/cpu%ld/cpu_capacity", c);
+      v = ReadSysfsU64(path);
+    }
+    metric[c] = v;
+    if (v) {
+      any = true;
+    }
+    highest = std::max(highest, v);
+  }
+  if (!any || !highest) {
+    return 0;  // topology unreadable -> stay out of the scheduler's way
+  }
+
+  uint64_t big_mask = 0;
+  int big_count = 0;
+  for (long c = 0; c < ncpu; ++c) {
+    // Within 5% of the top tier counts as a big core; clusters are not always
+    // reported with perfectly identical frequencies across SKUs.
+    if (metric[c] * 100 >= highest * 95) {
+      big_mask |= (1ULL << c);
+      ++big_count;
+    }
+  }
+
+  // Flat topology (every core is "big") -> nothing to gain from constraining.
+  if (big_count == ncpu) {
+    return 0;
+  }
+  // Too few total cores, or a big cluster too small to host the hot threads
+  // without serializing them onto one core -> bail to "no pin". A 4-core part,
+  // or any part with a single big core, falls here by design.
+  if (ncpu < 6 || big_count < 2) {
+    return 0;
+  }
+
+  return big_mask;
+}
+
+uint64_t BigClusterMask() {
+  static const uint64_t mask = DetectBigClusterMask();
+  return mask;
+}
+
+}  // namespace
+#endif  // REX_PLATFORM_ANDROID
+
+bool HotThreadPinningAvailable() {
+#if REX_PLATFORM_ANDROID
+  return BigClusterMask() != 0;
+#else
+  return false;
+#endif
+}
+
+bool PinCurrentThreadToBigCluster(const char* label) {
+#if REX_PLATFORM_ANDROID
+  if (!REXCVAR_GET(android_pin_hot_threads)) {
+    return false;
+  }
+  const uint64_t mask = BigClusterMask();
+  if (!mask) {
+    return false;
+  }
+
+  cpu_set_t cpus;
+  CPU_ZERO(&cpus);
+  for (int c = 0; c < 64; ++c) {
+    if (mask & (1ULL << c)) {
+      CPU_SET(c, &cpus);
+    }
+  }
+  // Self-target: sched_setaffinity(0, ...) is the calling thread on bionic,
+  // matching the audio fallback pacer. Pinning to the whole big-cluster mask
+  // (rather than one core) lets the scheduler keep the thread on big cores and
+  // spread the two hot threads across the cluster instead of serializing them.
+  bool pinned = sched_setaffinity(0, sizeof(cpus), &cpus) == 0;
+
+  // Bounded priority bump under the NORMAL scheduler (deliberately NOT
+  // SCHED_FIFO, unlike Thread::set_priority). A small negative nice nudges the
+  // scheduler to favour these frame-critical threads over background work while
+  // remaining fully preemptible, so a busy guest thread can never lock out the
+  // CP worker the way a real-time priority could. Best effort; ignored if the
+  // process rlimit (RLIMIT_NICE) does not permit it.
+  setpriority(PRIO_PROCESS, 0, -4);
+
+  REXSYS_INFO("hot-thread pin: '{}' -> big cluster mask 0x{:X}{}", label ? label : "?", mask,
+              pinned ? "" : " (sched_setaffinity failed, errno set)");
+  return pinned;
+#else
+  (void)label;
+  return false;
+#endif
+}
 
 // uint64_t ticks() { return mach_absolute_time(); }
 

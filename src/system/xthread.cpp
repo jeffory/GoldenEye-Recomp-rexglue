@@ -435,6 +435,27 @@ X_STATUS XThread::Create() {
     PROFILE_THREAD_ENTER(thread_name_.c_str());
     PROFILE_THREAD_CREATED();
 
+    // arm64 big.LITTLE: pin the two guest threads that gate frame throughput to
+    // the big cluster so the kernel cannot park them on a LITTLE core or bounce
+    // them between clusters. Matched by guest start address, the same way the
+    // lost-wakeup deadlock guard in xboxkrnl_threading.cpp keys off these
+    // threads (see docs/boot-startup-race.md in the wrapper):
+    //   0x8235E4A8 - main game thread (frame-limiter / frame-wait loop)
+    //   0x821A4A68 - deferred GPU command worker (ring drains -> screen freeze)
+    // No-op off Android, on non-big.LITTLE / few-core parts, or when the
+    // android_pin_hot_threads cvar is off. Done on-thread (self-target) here,
+    // before guest code runs.
+    switch (creation_params_.start_address) {
+      case 0x8235E4A8u:
+        rex::thread::PinCurrentThreadToBigCluster("guest main game thread");
+        break;
+      case 0x821A4A68u:
+        rex::thread::PinCurrentThreadToBigCluster("guest GPU command worker");
+        break;
+      default:
+        break;
+    }
+
     // Execute user code.
     current_xthread_tls_ = this;
     running_ = true;
