@@ -113,6 +113,11 @@ add_compile_options(
     $<$<CONFIG:DEBUG>:-O0>
     $<$<CONFIG:RELEASE>:-O3>
     $<$<CONFIG:RELEASE>:-DNDEBUG>
+    # RelWithDebInfo: full optimization + NDEBUG (elides asserts) + debug symbols
+    # for Android release APKs and symbol-preserving desktop profiling builds.
+    $<$<CONFIG:RelWithDebInfo>:-O3>
+    $<$<CONFIG:RelWithDebInfo>:-DNDEBUG>
+    $<$<CONFIG:RelWithDebInfo>:-g>
     -fno-char8_t
 )
 
