@@ -33,6 +33,17 @@ void EnableAffinityConfiguration() {
   SetProcessAffinityMask(process_handle, system_affinity_mask);
 }
 
+// big.LITTLE hot-thread pinning is an Android-only frame-throughput measure;
+// desktop Windows is not a target, so these are no-ops. See <rex/thread.h>.
+bool HotThreadPinningAvailable() {
+  return false;
+}
+
+bool PinCurrentThreadToBigCluster(const char* label) {
+  (void)label;
+  return false;
+}
+
 uint32_t current_thread_system_id() {
   return static_cast<uint32_t>(GetCurrentThreadId());
 }

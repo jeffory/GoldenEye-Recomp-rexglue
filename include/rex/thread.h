@@ -92,6 +92,36 @@ uint32_t logical_processor_count();
 // Must be called at startup before attempting to set thread affinity.
 void EnableAffinityConfiguration();
 
+// --- big.LITTLE hot-thread scheduling (arm64 handhelds) ----------------------
+// A couple of threads gate frame throughput: the guest main game thread and the
+// command-processor / GPU-command worker. On a big.LITTLE arm64 phone/handheld
+// the kernel is otherwise free to park them on a LITTLE core or bounce them
+// between clusters, which shows up as a large, jittery framerate hit. These
+// helpers pin such a thread to the big cluster with a small priority nudge.
+//
+// Detection and pinning are best-effort and entirely no-op when:
+//   * the build is not Android, or
+//   * the host is not big.LITTLE / has too few cores to pin without serializing
+//     the runtime onto a single big core, or
+//   * the cvar `android_pin_hot_threads` is disabled.
+//
+// Unlike set_priority() (which uses SCHED_FIFO and could starve a co-scheduled
+// worker), the nudge applied here is a bounded `nice` value under the normal
+// scheduler, so it cannot lock the CP worker out. It is also designed to live
+// alongside the audio fallback pacer's existing SCHED_FIFO pin: the pacer keeps
+// off CPU 0 and only wakes briefly each audio period, so it does not contend.
+
+// True when the host looks like a big.LITTLE part with enough cores that pinning
+// the hot threads to the big cluster will not serialize the runtime. Result is
+// detected once and cached.
+bool HotThreadPinningAvailable();
+
+// Pin the CALLING thread to the big cluster and apply a small priority bump.
+// Must be invoked from within the target thread itself (mirrors the audio
+// pacer's sched_setaffinity(0, ...) self-targeting). `label` is for logging
+// only. No-op per the conditions above. Returns true if a pin was applied.
+bool PinCurrentThreadToBigCluster(const char* label);
+
 // Gets a stable thread-specific ID, but may not be. Use for informative
 // purposes only.
 uint32_t current_thread_system_id();
