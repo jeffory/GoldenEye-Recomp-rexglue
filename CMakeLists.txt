@@ -18,6 +18,7 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
 option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
 option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" ON)
 option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" ON)
+option(REXGLUE_BUILD_SECONDARY_UI_DEMO     "Build the desktop secondary-render-surface demo harness" OFF)
 # Tracy ships a shared client lib with desktop-oriented assumptions; disable it
 # for the initial Android bring-up to minimise build friction. Re-enable later
 # once the Android target is stable.
@@ -240,6 +241,11 @@ add_subdirectory(src/rexglue)
 if(REXGLUE_BUILD_TESTS)
     enable_testing()
     add_subdirectory(tests)
+endif()
+
+# Optional desktop harness proving the secondary render surface (dual-screen).
+if(REXGLUE_BUILD_SECONDARY_UI_DEMO)
+    add_subdirectory(examples/secondary_ui)
 endif()
 
 # Print configuration summary

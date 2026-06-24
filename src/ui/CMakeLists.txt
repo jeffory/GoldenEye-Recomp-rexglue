@@ -2,6 +2,7 @@
 
 # Core UI sources
 set(REXUI_CORE_SOURCES
+    external_window.cpp
     graphics_upload_buffer_pool.cpp
     graphics_util.cpp
     imgui_dialog.cpp
@@ -11,6 +12,7 @@ set(REXUI_CORE_SOURCES
     menu_item.cpp
     presenter.cpp
     renderdoc_api.cpp
+    secondary_ui_surface.cpp
     window.cpp
     windowed_app.cpp
     windowed_app_context.cpp
