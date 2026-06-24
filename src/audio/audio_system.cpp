@@ -203,10 +203,19 @@ void AudioSystem::Shutdown() {
   worker_running_ = false;
   shutdown_event_->Set();
   if (worker_thread_) {
-    // The worker may be stuck inside a guest callback that is itself blocked
-    // on guest objects (e.g. KeWaitForMultipleObjects).
-    // Terminate the thread to break the deadlock.
-    worker_thread_->Terminate(0);
+    // The worker spends almost all its time idle in WaitAny(); clearing
+    // worker_running_ and signalling shutdown_event_ wakes it within <=500ms and
+    // it returns cleanly. JOIN it first -- only force-terminate if it is genuinely
+    // wedged inside a guest callback (blocked on a guest object). Async
+    // pthread_cancel/pthread_kill of a thread holding clients_mutex_ or the libc
+    // heap lock corrupts teardown (the crash-after-exit). Mirrors
+    // XmaDecoder::Shutdown's join-with-timeout.
+    auto result =
+        rex::thread::Wait(worker_thread_->thread(), false, std::chrono::milliseconds(2000));
+    if (result == rex::thread::WaitResult::kTimeout) {
+      REXAPU_WARN("Audio: worker thread did not exit within 2s, terminating");
+      worker_thread_->Terminate(0);
+    }
     worker_thread_.reset();
   }
 
