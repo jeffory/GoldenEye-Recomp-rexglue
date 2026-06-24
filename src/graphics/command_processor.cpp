@@ -99,11 +99,34 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
                     "pipelines are being prepared.")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
 
+// On few-core arm64 handhelds the CP busy-waits (the WAIT_REG_MEM fence poll and
+// the CP ring-empty stall) historically called rex::thread::MaybeYield() - a
+// sched_yield() syscall plus a full memory barrier - on EVERY spin iteration.
+// That is a syscall storm: it oversubscribes the limited cores and starves the
+// very CP worker that must advance the ring. Instead, mirror the guest spinlock
+// (xeKeKfAcquireSpinLock): spin locally with a cheap, exponentially growing
+// cpu_relax() pause burst first, and only fall back to a real yield/sleep once
+// that budget is exhausted (the producer is then probably descheduled and we DO
+// want to give up the core). Tunable live so the backoff can be A/B'd on-device;
+// 0 reproduces the legacy always-yield behavior.
+REXCVAR_DEFINE_INT32(gpu_spin_yield_threshold, 16, "GPU",
+                     "GPU busy-wait backoff: number of cheap cpu_relax() pause bursts to spin "
+                     "locally before falling back to a sched_yield()/sleep in the WAIT_REG_MEM "
+                     "fence poll and the CP ring-empty wait. Higher = fewer syscalls but more "
+                     "busy-spin; 0 = always yield (legacy behavior). Mainly for low-core arm64.")
+    .range(0, 4096)
+    .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
 namespace rex::graphics {
 
 using namespace rex::graphics::xenos;
 
 namespace {
+
+// Cap on the exponential pause burst inside the GPU spin backoff: 1<<6 = 64
+// cpu_relax() hints per iteration, matching kSpinBackoffMaxShift in the guest
+// spinlock so the two backoffs behave consistently.
+constexpr uint32_t kGpuSpinBackoffMaxShift = 6;
 
 ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
   if (value == "fast") {
@@ -351,15 +374,34 @@ void CommandProcessor::WorkerThreadMain() {
       // event is too high.
       PrepareForWait();
       uint32_t loop_count = 0;
+      uint32_t spin = 0;
+      const uint32_t yield_threshold =
+          static_cast<uint32_t>(std::max(0, REXCVAR_GET(gpu_spin_yield_threshold)));
       do {
-        // If we spin around too much, revert to a "low-power" state.
+        // If we spin around too much, revert to a "low-power" state. Once here
+        // the 5ms event wait dominates timing, so keep the original yield tail -
+        // one sched_yield per 5ms is not a storm.
         if (loop_count > 500) {
           const int wait_time_ms = 5;
           rex::thread::Wait(write_ptr_index_event_.get(), true,
                             std::chrono::milliseconds(wait_time_ms));
+          rex::thread::MaybeYield();
+          spin = 0;
+        } else if (spin < yield_threshold) {
+          // Cheap local backoff before paying for a sched_yield() syscall: a
+          // bounded, exponentially growing cpu_relax() pause burst. This is the
+          // hot first ~500 iterations and the arm64 yield-storm offender.
+          const uint32_t burst = 1u << std::min(spin, kGpuSpinBackoffMaxShift);
+          for (uint32_t i = 0; i < burst; ++i) {
+            rex::thread::cpu_relax();
+          }
+          ++spin;
+        } else {
+          // Backoff budget exhausted: the producer is likely descheduled. Yield
+          // the core to it, then resume cheap spinning.
+          rex::thread::MaybeYield();
+          spin = 0;
         }
-
-        rex::thread::MaybeYield();
         loop_count++;
         write_ptr_index = write_ptr_index_.load();
       } while (worker_running_ && pending_fns_.empty() &&
@@ -1212,6 +1254,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   const auto wait_deadline =
       std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
 
+  // Cheap-backoff state (arm64 yield-storm mitigation). See gpu_spin_yield_threshold.
+  uint32_t spin = 0;
+  const uint32_t yield_threshold =
+      static_cast<uint32_t>(std::max(0, REXCVAR_GET(gpu_spin_yield_threshold)));
+
   bool matched = false;
   do {
     uint32_t value = 0;
@@ -1261,10 +1308,29 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
             poll_reg_addr, ref, mask, wait_info & 0x7);
         break;
       }
+
+      // Cheap local backoff before any sched_yield()/sleep. On the vsync-ON path
+      // the 1ms sleep is an intentional frame-pacing wait, so leave it untouched;
+      // the backoff applies to the fast (vsync-OFF) path and the short
+      // (wait < 0x100) path, which previously yielded on every iteration and were
+      // the arm64 sched_yield storm. The 60ms deadline above is still re-checked
+      // every outer iteration, and each pause burst is only a few microseconds.
+      const bool vsync_on = REXCVAR_GET(vsync);
+      const bool can_backoff = (wait < 0x100) || !vsync_on;
+      if (can_backoff && spin < yield_threshold) {
+        const uint32_t burst = 1u << std::min(spin, kGpuSpinBackoffMaxShift);
+        for (uint32_t i = 0; i < burst; ++i) {
+          rex::thread::cpu_relax();
+        }
+        ++spin;
+        continue;
+      }
+      spin = 0;
+
       // Wait.
       if (wait >= 0x100) {
         PrepareForWait();
-        if (!REXCVAR_GET(vsync)) {
+        if (!vsync_on) {
           // User wants it fast and dangerous.
           rex::thread::MaybeYield();
         } else {
