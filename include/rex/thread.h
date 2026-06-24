@@ -108,6 +108,23 @@ void set_current_thread_name(const std::string_view name);
 // Yields the current thread to the scheduler. Maybe.
 void MaybeYield();
 
+// Cheap architectural "spin-wait hint" for busy-wait loops: an ARM64 `yield` /
+// x86 `pause` pipeline hint that issues NO syscall and NO memory barrier (unlike
+// MaybeYield(), which is a sched_yield() syscall plus a full __sync_synchronize()
+// on every call). Spin locally on this for a bounded budget before falling back
+// to MaybeYield()/Sleep(), so few-core arm64 handhelds are not buried under a
+// sched_yield() syscall storm that starves the thread you are waiting on. Mirrors
+// the guest spinlock backoff in xeKeKfAcquireSpinLock().
+inline void cpu_relax() {
+#if REX_ARCH_ARM64
+  __asm__ __volatile__("yield" ::: "memory");
+#elif REX_ARCH_AMD64
+  __asm__ __volatile__("pause" ::: "memory");
+#else
+  std::atomic_signal_fence(std::memory_order_seq_cst);
+#endif
+}
+
 // Memory barrier (request - may be ignored).
 void SyncMemory();
 
