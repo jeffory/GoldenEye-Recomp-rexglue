@@ -82,6 +82,17 @@ class AndroidWindow final : public Window {
     }
   }
 
+  // True when a paint has been requested but not yet performed. The UI loop
+  // uses this to skip its frame-paced poll sleep entirely: an ALooper_wake sent
+  // by RequestPaintImpl can be silently consumed by the loop's post-paint
+  // zero-timeout drain (ALooper_pollOnce reads the wake fd and returns
+  // ALOOPER_POLL_WAKE), after which a full 16ms sleep would sit on top of an
+  // already-pending frame -- that capped displayed fps at ~49 while the guest
+  // produced 60.
+  bool HasPendingPaint() const {
+    return paint_pending_.load(std::memory_order_acquire);
+  }
+
  protected:
   bool OpenImpl() override;
   void RequestCloseImpl() override;

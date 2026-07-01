@@ -292,7 +292,17 @@ std::atomic<uint64_t> ge_present_new_frame_count{0};  // presents showing a NEW 
 std::atomic<uint64_t> ge_guest_refresh_count{0};      // guest frames delivered to the mailbox
 std::atomic<uint64_t> ge_guest_drop_count{0};         // ready frames replaced unconsumed
 std::atomic<uint64_t> ge_present_block_us{0};         // cumulative PaintAndPresent wall time
+// True while a delivered guest frame sits in the mailbox unconsumed. The
+// Android UI loop uses this to service GUEST frames immediately (skip its
+// frame-paced poll sleep / wake the looper) while UI-only repaint requests
+// (ImGui overlays re-arm a paint after every paint) stay paced by the poll
+// timeout -- servicing those eagerly span the loop at ~220 paints/s.
+std::atomic<bool> ge_guest_frame_waiting{false};
 }  // namespace
+
+extern "C" bool rex_ge_guest_frame_waiting() {
+  return ge_guest_frame_waiting.load(std::memory_order_relaxed);
+}
 
 extern "C" uint64_t rex_ge_present_paint_count() {
   return ge_present_paint_count.load(std::memory_order_relaxed);
@@ -633,6 +643,7 @@ bool Presenter::RefreshGuestOutput(
   // time), it has just been dropped without ever reaching the display.
   if (is_active) {
     ge_guest_refresh_count.fetch_add(1, std::memory_order_relaxed);
+    ge_guest_frame_waiting.store(true, std::memory_order_release);
     if (((last_acquired_and_ready >> 2) & 3) != (last_acquired_and_ready & 3)) {
       ge_guest_drop_count.fetch_add(1, std::memory_order_relaxed);
     }
@@ -895,6 +906,10 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
   if (properties.IsActive() && mailbox_index != ge_entry_acquired) {
     ge_present_new_frame_count.fetch_add(1, std::memory_order_relaxed);
+    // The latest ready frame is now acquired; nothing newer is waiting. A
+    // refresh racing in right after this store re-sets the flag itself (worst
+    // case: one frame waits out one poll timeout).
+    ge_guest_frame_waiting.store(false, std::memory_order_relaxed);
   }
   mailbox_index_or_max_if_inactive_out = properties.IsActive() ? mailbox_index : UINT32_MAX;
   if (properties_out) {

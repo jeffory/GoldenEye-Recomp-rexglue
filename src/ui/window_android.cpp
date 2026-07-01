@@ -104,11 +104,36 @@ std::unique_ptr<Surface> AndroidWindow::CreateSurfaceImpl(Surface::TypeFlags all
   return std::make_unique<AndroidNativeWindowSurface>(native_window_);
 }
 
+// GE diagnostics: how often paints are actually REQUESTED (and the UI loop
+// woken) -- read together with the presenter's paint counters to tell "requests
+// arrive slower than expected" apart from "the loop paints slower than
+// requested". Same extern "C" export pattern as the presenter counters.
+static std::atomic<uint64_t> ge_paint_request_count{0};
+extern "C" uint64_t rex_ge_paint_request_count() {
+  return ge_paint_request_count.load(std::memory_order_relaxed);
+}
+
+// Defined in presenter.cpp: a delivered guest frame sits unconsumed in the
+// mailbox. Only those paints are urgent; UI-only repaint requests (ImGui
+// overlays re-arm one after every paint) must stay paced by the loop's poll
+// timeout or the loop spins at max paint rate (~220/s measured).
+extern "C" bool rex_ge_guest_frame_waiting();
+
 void AndroidWindow::RequestPaintImpl() {
   // Called from any thread (the presenter requests a paint after the guest
   // produces a frame). Flag it; the UI loop drives the actual OnPaint/present
-  // via PaintFromUiThreadIfRequested(). The loop's frame-paced wake picks it up.
+  // via PaintFromUiThreadIfRequested().
   paint_pending_.store(true, std::memory_order_release);
+  ge_paint_request_count.fetch_add(1, std::memory_order_relaxed);
+  // Wake the UI loop NOW for guest frames instead of letting them sit pending
+  // for the rest of the loop's frame-paced ALooper_pollOnce(16ms) timeout.
+  // Without the wake the loop serialized to (up-to-16ms sleep + paint) per
+  // frame, capping displayed fps at ~48 while the guest produced 60 (measured
+  // on the Ayn Thor: GESHOWN shown/s=48 drop/s=11 paint=4.4ms). UI-only
+  // repaints deliberately do NOT wake -- the 16ms timeout paces them.
+  if (rex_ge_guest_frame_waiting()) {
+    static_cast<AndroidWindowedAppContext&>(app_context()).WakeUILoop();
+  }
 }
 
 // Android has no native menu bar; the in-app ImGui menus handle UI. Provide a

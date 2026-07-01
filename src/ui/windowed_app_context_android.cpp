@@ -52,6 +52,17 @@ void DrainAndroidInputQueue(android_app* app) {
 }
 }  // namespace
 
+// GE diagnostics: UI-loop iteration rate, to separate "loop runs slower than
+// paint requests" from "paints are requested slower than frames are produced".
+static std::atomic<uint64_t> ge_ui_loop_iteration_count{0};
+extern "C" uint64_t rex_ge_ui_loop_iteration_count() {
+  return ge_ui_loop_iteration_count.load(std::memory_order_relaxed);
+}
+
+// Defined in presenter.cpp: a delivered guest frame sits unconsumed in the
+// mailbox (see RunMainAndroidLoop's poll-timeout selection).
+extern "C" bool rex_ge_guest_frame_waiting();
+
 AndroidWindowedAppContext::AndroidWindowedAppContext(android_app* app) : app_(app) {
   app_->userData = this;
   app_->onAppCmd = &AndroidWindowedAppContext::OnAppCmdThunk;
@@ -68,11 +79,15 @@ AndroidWindowedAppContext::~AndroidWindowedAppContext() {
   }
 }
 
-void AndroidWindowedAppContext::NotifyUILoopOfPendingFunctions() {
-  // Wake the looper so the next RunMainAndroidLoop iteration drains the queue.
+void AndroidWindowedAppContext::WakeUILoop() {
   if (app_ && app_->looper) {
     ALooper_wake(app_->looper);
   }
+}
+
+void AndroidWindowedAppContext::NotifyUILoopOfPendingFunctions() {
+  // Wake the looper so the next RunMainAndroidLoop iteration drains the queue.
+  WakeUILoop();
 }
 
 void AndroidWindowedAppContext::PlatformQuitFromUIThread() {
@@ -88,6 +103,7 @@ void AndroidWindowedAppContext::RunMainAndroidLoop() {
     return;
   }
   while (!HasQuitFromUIThread()) {
+    ge_ui_loop_iteration_count.fetch_add(1, std::memory_order_relaxed);
     int events;
     android_poll_source* source = nullptr;
     // Wake at least once per frame (~16 ms). The guest renders/presents on its
@@ -96,7 +112,22 @@ void AndroidWindowedAppContext::RunMainAndroidLoop() {
     // the input-queue fd does not reliably wake this looper on every device, so
     // a frame-paced timeout plus the explicit DrainAndroidInputQueue() below
     // guarantees key events are dispatched and finished promptly (no ANR).
-    int ident = ALooper_pollOnce(16, nullptr, &events, reinterpret_cast<void**>(&source));
+    // Frame-paced 16ms sleep, EXCEPT when a new guest frame is waiting to be
+    // shown -- that must be serviced immediately: the ALooper_wake from
+    // RequestPaintImpl can be eaten by the zero-timeout drain below (pollOnce
+    // consumes the wake fd and returns ALOOPER_POLL_WAKE), and sleeping 16ms
+    // on top of a pending frame serialized the loop to (16ms + paint) per
+    // frame -- measured 49 shown/s vs 60 produced on the Ayn Thor (GESHOWN2
+    // req/s=loop/s=49). Gating on the guest frame (not just HasPendingPaint)
+    // keeps UI-only repaint requests paced at the poll timeout; skipping the
+    // sleep for ANY pending paint span the loop at ~220 paints/s because
+    // ImGui overlays re-arm a paint request after every paint.
+    int poll_timeout_ms =
+        (window_ && window_->HasPendingPaint() && rex_ge_guest_frame_waiting())
+            ? 0
+            : 16;
+    int ident = ALooper_pollOnce(poll_timeout_ms, nullptr, &events,
+                                 reinterpret_cast<void**>(&source));
     if (ident >= 0 && source) {
       source->process(app_, source);  // dispatches to OnAppCmd / input
     }

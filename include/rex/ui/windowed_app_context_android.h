@@ -51,6 +51,12 @@ class AndroidWindowedAppContext final : public WindowedAppContext {
   // UI thread (android_main) after the app's OnInitialize().
   void RunMainAndroidLoop();
 
+  // Wake the UI loop immediately (thread-safe, callable from any thread). Used
+  // by AndroidWindow::RequestPaintImpl so a freshly produced guest frame is
+  // painted now instead of sitting pending for the remainder of the loop's
+  // frame-paced ALooper_pollOnce timeout.
+  void WakeUILoop();
+
  protected:
   void NotifyUILoopOfPendingFunctions() override;
   void PlatformQuitFromUIThread() override;
