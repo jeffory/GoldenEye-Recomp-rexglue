@@ -279,6 +279,37 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
 
 }  // namespace
 
+// --- GE present-cadence diagnostics -----------------------------------------
+// Lock-free counters answering "how many guest frames actually reach the
+// display, and where are the rest lost?" -- the guest can produce frames much
+// faster than the UI thread paints them (the mailbox intentionally REPLACES an
+// unconsumed ready image for latency), and nothing measured that loss.
+// Exported extern "C" (same pattern as rex_ge_cp_progress_seq) so the game's
+// hooks can read them without SDK headers. Monotonic; consumers take deltas.
+namespace {
+std::atomic<uint64_t> ge_present_paint_count{0};      // successful presents
+std::atomic<uint64_t> ge_present_new_frame_count{0};  // presents showing a NEW guest frame
+std::atomic<uint64_t> ge_guest_refresh_count{0};      // guest frames delivered to the mailbox
+std::atomic<uint64_t> ge_guest_drop_count{0};         // ready frames replaced unconsumed
+std::atomic<uint64_t> ge_present_block_us{0};         // cumulative PaintAndPresent wall time
+}  // namespace
+
+extern "C" uint64_t rex_ge_present_paint_count() {
+  return ge_present_paint_count.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t rex_ge_present_new_frame_count() {
+  return ge_present_new_frame_count.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t rex_ge_guest_refresh_count() {
+  return ge_guest_refresh_count.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t rex_ge_guest_drop_count() {
+  return ge_guest_drop_count.load(std::memory_order_relaxed);
+}
+extern "C" uint64_t rex_ge_present_block_us() {
+  return ge_present_block_us.load(std::memory_order_relaxed);
+}
+
 namespace rex {
 namespace ui {
 
@@ -597,6 +628,16 @@ bool Presenter::RefreshGuestOutput(
       last_acquired_and_ready,
       (last_acquired_and_ready & 3) | (guest_output_mailbox_writable_ << 2),
       std::memory_order_acq_rel, std::memory_order_relaxed)) {}
+  // GE diagnostics: one guest frame delivered to the mailbox. If the PREVIOUS
+  // ready image was never acquired by a consumer (ready != acquired at replace
+  // time), it has just been dropped without ever reaching the display.
+  if (is_active) {
+    ge_guest_refresh_count.fetch_add(1, std::memory_order_relaxed);
+    if (((last_acquired_and_ready >> 2) & 3) != (last_acquired_and_ready & 3)) {
+      ge_guest_drop_count.fetch_add(1, std::memory_order_relaxed);
+    }
+  }
+
   // Now, it's known that `ready == writable` on the host presentation side.
   // Take the next `writable` with this assumption about its current value in
   // mind.
@@ -829,6 +870,10 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   // consumer though, the consumer mutex performs memory access ordering).
   uint32_t old_acquired_and_ready =
       guest_output_mailbox_acquired_and_ready_.load(std::memory_order_relaxed);
+  // GE diagnostics: remember which image was acquired on entry -- if the index
+  // changes below, this consumption shows a NEW guest frame (vs re-presenting
+  // the same image, e.g. a UI-only repaint).
+  uint32_t ge_entry_acquired = old_acquired_and_ready & 3;
   // Desired acquired = current ready.
   // Desired ready = current ready (changed only by the producer).
   uint32_t desired_acquired_and_ready =
@@ -848,6 +893,9 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
   // Give the current acquired image to the caller, or UINT32_MAX if it's
   // inactive.
   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+  if (properties.IsActive() && mailbox_index != ge_entry_acquired) {
+    ge_present_new_frame_count.fetch_add(1, std::memory_order_relaxed);
+  }
   mailbox_index_or_max_if_inactive_out = properties.IsActive() ? mailbox_index : UINT32_MAX;
   if (properties_out) {
     *properties_out = properties;
@@ -1502,7 +1550,19 @@ bool Presenter::InSurfaceOnMonitorFromUIThread() const {
 Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   assert_false(execute_ui_drawers && !is_in_ui_thread_paint_);
   assert_true(surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable);
+  // GE diagnostics: wall time of the whole paint+present (includes any FIFO
+  // vsync block in acquire/present -- on Android this runs on the UI thread
+  // and directly gates how fast frames can reach the display).
+  const auto ge_paint_start = std::chrono::steady_clock::now();
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
+  ge_present_block_us.fetch_add(
+      static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+                                std::chrono::steady_clock::now() - ge_paint_start)
+                                .count()),
+      std::memory_order_relaxed);
+  if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
+    ge_present_paint_count.fetch_add(1, std::memory_order_relaxed);
+  }
   switch (result) {
     case PaintResult::kPresented:
       surface_paint_connection_was_optimal_at_successful_paint_ = true;
