@@ -34,6 +34,7 @@
 #endif
 #include <rex/input/input_system.h>
 #include <rex/kernel/init.h>
+#include <rex/perf/counter.h>
 #include <rex/system.h>
 #include <rex/system/kernel_state.h>
 #include <rex/system/xthread.h>
@@ -149,6 +150,19 @@ bool ReXApp::SetupEnvironment() {
 
   if (std::filesystem::exists(config_path_))
     REXLOG_INFO("Loaded config: {}", config_path_.filename().string());
+
+#ifdef REXGLUE_ENABLE_PERF_COUNTERS
+  // Activate the per-frame perf-counter CSV if configured. The writer itself
+  // (rex::perf::WriteCsvFrame) has always run from Profiler::Flip(); this cvar
+  // was defined but never consumed, so the pipeline was dead until now.
+  {
+    std::string perf_csv = rex::cvar::GetFlagByName("perf_log_csv");
+    if (!perf_csv.empty()) {
+      rex::perf::SetCsvLogPath(perf_csv);
+      REXLOG_INFO("  Perf CSV:       {}", perf_csv);
+    }
+  }
+#endif
 
   REXLOG_INFO("{} starting", GetName());
   if (!game_data_root_.empty()) {

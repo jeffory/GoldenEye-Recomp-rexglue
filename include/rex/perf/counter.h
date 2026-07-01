@@ -49,6 +49,16 @@ enum class CounterId : uint16_t {
   kPipelineCacheHits,
   kPipelineCacheMisses,
 
+  // Frame-stage timing (us per frame) -- attribute a spike to guest-CPU sim vs
+  // command-processor vs GPU vs present. Accumulated on their own threads,
+  // snapshotted by Profiler::Flip() like everything else.
+  kCpExecuteUs,      // CP worker: inside ExecutePrimaryBuffer
+  kCpIdleUs,         // CP worker: empty-ring stall spin
+  kCpWaitRegMemUs,   // CP worker: blocked in WAIT_REG_MEM fence
+  kPresentBlockUs,   // UI thread: PaintAndPresent wall time
+  kGuestGpuWaitUs,   // guest threads: yield-spinning on GPU completion
+  kGpuFrameUs,       // GPU: submission execution time (Vulkan timestamps)
+
   kCount  // sentinel -- must be last
 };
 
@@ -157,6 +167,12 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS() PERF_counter_inc(kTextureCacheMisses)
 #define PROFILE_PIPELINE_CACHE_HIT() PERF_counter_inc(kPipelineCacheHits)
 #define PROFILE_PIPELINE_CACHE_MISS() PERF_counter_inc(kPipelineCacheMisses)
+#define PROFILE_CP_EXECUTE_US(v) PERF_counter_add(kCpExecuteUs, v)
+#define PROFILE_CP_IDLE_US(v) PERF_counter_add(kCpIdleUs, v)
+#define PROFILE_CP_WAIT_REG_MEM_US(v) PERF_counter_add(kCpWaitRegMemUs, v)
+#define PROFILE_PRESENT_BLOCK_US(v) PERF_counter_add(kPresentBlockUs, v)
+#define PROFILE_GUEST_GPU_WAIT_US(v) PERF_counter_add(kGuestGpuWaitUs, v)
+#define PROFILE_GPU_FRAME_US(v) PERF_counter_set(kGpuFrameUs, v)
 
 #else
 
@@ -182,5 +198,11 @@ class Profiler {
 #define PROFILE_TEXTURE_CACHE_MISS()
 #define PROFILE_PIPELINE_CACHE_HIT()
 #define PROFILE_PIPELINE_CACHE_MISS()
+#define PROFILE_CP_EXECUTE_US(v)
+#define PROFILE_CP_IDLE_US(v)
+#define PROFILE_CP_WAIT_REG_MEM_US(v)
+#define PROFILE_PRESENT_BLOCK_US(v)
+#define PROFILE_GUEST_GPU_WAIT_US(v)
+#define PROFILE_GPU_FRAME_US(v)
 
 #endif

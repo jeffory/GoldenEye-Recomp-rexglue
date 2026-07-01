@@ -17,6 +17,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 
 REXCVAR_DEFINE_STRING(perf_log_csv, "", "Perf",
                       "Path to write per-frame CSV log (empty = disabled)");
@@ -48,6 +49,12 @@ constexpr const char* kCounterNames[] = {
     "texture_cache_misses",
     "pipeline_cache_hits",
     "pipeline_cache_misses",
+    "cp_execute_us",
+    "cp_idle_us",
+    "cp_wait_reg_mem_us",
+    "present_block_us",
+    "guest_gpu_wait_us",
+    "gpu_frame_us",
 };
 static_assert(std::size(kCounterNames) == kNumCounters, "kCounterNames must match CounterId enum");
 
@@ -71,10 +78,19 @@ constexpr bool kIsGauge[] = {
     false,  // kTextureCacheMisses
     false,  // kPipelineCacheHits
     false,  // kPipelineCacheMisses
+    false,  // kCpExecuteUs       (accumulated per frame)
+    false,  // kCpIdleUs          (accumulated per frame)
+    false,  // kCpWaitRegMemUs    (accumulated per frame)
+    false,  // kPresentBlockUs    (accumulated per frame)
+    false,  // kGuestGpuWaitUs    (accumulated per frame)
+    false,  // kGpuFrameUs        (set per frame)
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 
-// CSV state
+// CSV state. Guarded by g_csv_mutex: WriteCsvFrame runs on the CP worker while
+// SetCsvLogPath can be called live from the UI thread (pause-menu toggle).
+// Uncontended lock per frame write -- negligible next to the fprintf itself.
+std::mutex g_csv_mutex;
 std::FILE* g_csv_file = nullptr;
 std::string g_csv_path;
 int g_csv_frame_count = 0;
@@ -125,6 +141,7 @@ void Init() {
 }
 
 void SetCsvLogPath(const std::string& path) {
+  std::lock_guard<std::mutex> lock(g_csv_mutex);
   if (g_csv_file) {
     std::fflush(g_csv_file);
     std::fclose(g_csv_file);
@@ -153,6 +170,7 @@ void SetCsvLogPath(const std::string& path) {
 }
 
 void WriteCsvFrame() {
+  std::lock_guard<std::mutex> lock(g_csv_mutex);
   if (!g_csv_file)
     return;
 
@@ -170,6 +188,7 @@ void WriteCsvFrame() {
 }
 
 void FlushCsv() {
+  std::lock_guard<std::mutex> lock(g_csv_mutex);
   if (g_csv_file) {
     std::fflush(g_csv_file);
     std::fclose(g_csv_file);

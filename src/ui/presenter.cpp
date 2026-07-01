@@ -18,6 +18,7 @@
 #include <rex/assert.h>
 #include <rex/cvar.h>
 #include <rex/logging.h>
+#include <rex/perf/counter.h>
 #include <rex/platform.h>
 #include <rex/ui/presenter.h>
 #include <rex/ui/window.h>
@@ -1570,11 +1571,12 @@ Presenter::PaintResult Presenter::PaintAndPresent(bool execute_ui_drawers) {
   // and directly gates how fast frames can reach the display).
   const auto ge_paint_start = std::chrono::steady_clock::now();
   PaintResult result = PaintAndPresentImpl(execute_ui_drawers);
-  ge_present_block_us.fetch_add(
+  const auto ge_paint_us =
       static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
                                 std::chrono::steady_clock::now() - ge_paint_start)
-                                .count()),
-      std::memory_order_relaxed);
+                                .count());
+  ge_present_block_us.fetch_add(ge_paint_us, std::memory_order_relaxed);
+  PROFILE_PRESENT_BLOCK_US(static_cast<int64_t>(ge_paint_us));
   if (result == PaintResult::kPresented || result == PaintResult::kPresentedSuboptimal) {
     ge_present_paint_count.fetch_add(1, std::memory_order_relaxed);
   }
