@@ -368,6 +368,9 @@ void CommandProcessor::WorkerThreadMain() {
       // We've run out of commands to execute.
       // We spin here waiting for new ones, as the overhead of waiting on our
       // event is too high.
+      // Stage timing: bill the empty-ring spin to kCpIdleUs (2 clock reads per
+      // stall episode, not per spin iteration -- see perf/counter.h).
+      const auto ge_idle_start = std::chrono::steady_clock::now();
       PrepareForWait();
       uint32_t loop_count = 0;
       do {
@@ -384,6 +387,9 @@ void CommandProcessor::WorkerThreadMain() {
       } while (worker_running_ && pending_fns_.empty() &&
                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
       ReturnFromWait();
+      PROFILE_CP_IDLE_US(std::chrono::duration_cast<std::chrono::microseconds>(
+                             std::chrono::steady_clock::now() - ge_idle_start)
+                             .count());
       if (!worker_running_ || !pending_fns_.empty()) {
         continue;
       }
@@ -391,7 +397,12 @@ void CommandProcessor::WorkerThreadMain() {
     assert_true(read_ptr_index_ != write_ptr_index);
 
     // Execute. Note that we handle wraparound transparently.
+    // Stage timing: bill PM4 translation + submission to kCpExecuteUs.
+    const auto ge_exec_start = std::chrono::steady_clock::now();
     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+    PROFILE_CP_EXECUTE_US(std::chrono::duration_cast<std::chrono::microseconds>(
+                              std::chrono::steady_clock::now() - ge_exec_start)
+                              .count());
 
     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
     //     that many indices.
@@ -1228,10 +1239,11 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
   // give up and proceed, which lets the CP advance, the guest wait clear, and
   // the CPU resume and write the fence. Worst case is a one-frame artifact, not
   // a hard freeze.
-  const auto wait_deadline =
-      std::chrono::steady_clock::now() + std::chrono::milliseconds(60);
+  const auto ge_wait_start = std::chrono::steady_clock::now();
+  const auto wait_deadline = ge_wait_start + std::chrono::milliseconds(60);
 
   bool matched = false;
+  bool ge_ever_waited = false;
   do {
     uint32_t value = 0;
     if (is_memory) {
@@ -1273,6 +1285,7 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
         break;
     }
     if (!matched) {
+      ge_ever_waited = true;
       if (std::chrono::steady_clock::now() >= wait_deadline) {
         ge_cp_wait_reg_mem_timeouts.fetch_add(1, std::memory_order_relaxed);
         REXGPU_WARN(
@@ -1307,6 +1320,16 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
       }
     }
   } while (!matched);
+
+  // Stage timing: bill CPU<->GPU fence blocking to kCpWaitRegMemUs, and fire
+  // the (previously dead) command-buffer-stall counter once per wait that
+  // actually looped -- a first-poll match is not a stall.
+  if (ge_ever_waited) {
+    PROFILE_CP_WAIT_REG_MEM_US(std::chrono::duration_cast<std::chrono::microseconds>(
+                                   std::chrono::steady_clock::now() - ge_wait_start)
+                                   .count());
+    PROFILE_CMD_BUFFER_STALL();
+  }
 
   return true;
 }
