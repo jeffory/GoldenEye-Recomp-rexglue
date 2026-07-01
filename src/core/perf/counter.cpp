@@ -83,7 +83,7 @@ constexpr bool kIsGauge[] = {
     false,  // kCpWaitRegMemUs    (accumulated per frame)
     false,  // kPresentBlockUs    (accumulated per frame)
     false,  // kGuestGpuWaitUs    (accumulated per frame)
-    false,  // kGpuFrameUs        (set per frame)
+    false,  // kGpuFrameUs        (accumulated per frame; one add per submission)
 };
 static_assert(std::size(kIsGauge) == kNumCounters, "kIsGauge must match CounterId enum");
 

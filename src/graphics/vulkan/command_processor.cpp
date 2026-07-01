@@ -28,6 +28,7 @@
 #include <rex/dbg.h>
 #include <rex/logging.h>
 #include <rex/math.h>
+#include <rex/perf/counter.h>
 #include <rex/platform.h>
 #include <rex/graphics/util/draw.h>
 #include <rex/graphics/flags.h>
@@ -68,6 +69,11 @@ REXCVAR_DEFINE_BOOL(vulkan_submit_on_primary_buffer_end, !REX_PLATFORM_ANDROID, 
                     "Submit command buffer when PM4 primary buffer ends (off by default on "
                     "mobile to coalesce submits to frame granularity)")
     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+
+REXCVAR_DEFINE_BOOL(ge_gpu_timestamps, false, "GPU/Vulkan",
+                    "GoldenEye: measure GPU execution time per submission with "
+                    "Vulkan timestamp queries (feeds the gpu_frame_us perf "
+                    "counter / the FPS overlay's gpu bar)");
 
 REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
                     "Use VK_KHR_dynamic_rendering for Vulkan GPU emulation when supported by the "
@@ -1908,16 +1914,103 @@ bool VulkanCommandProcessor::SetupContext() {
 
   occlusion_query_resources_available_ = InitializeOcclusionQueryResources();
 
+  InitializeGeGpuTimestampResources();
+
   // Just not to expose uninitialized memory.
   std::memset(&system_constants_, 0, sizeof(system_constants_));
 
   return true;
 }
 
+void VulkanCommandProcessor::InitializeGeGpuTimestampResources() {
+  ge_gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  ge_gpu_timestamp_period_ns_ = 0.0f;
+  ge_gpu_timestamp_written_this_submission_ = false;
+  std::memset(ge_gpu_timestamp_slot_submission_, 0, sizeof(ge_gpu_timestamp_slot_submission_));
+  if (!REXCVAR_GET(ge_gpu_timestamps)) {
+    return;
+  }
+
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
+
+  // Timestamps must be supported on the graphics/compute queue family (Vulkan
+  // guarantees nothing here -- Adreno/Mali report per family) and the period
+  // must be sane.
+  VkPhysicalDeviceProperties physical_properties;
+  ifn.vkGetPhysicalDeviceProperties(vulkan_device->physical_device(), &physical_properties);
+  uint32_t queue_family_count = 0;
+  ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(),
+                                               &queue_family_count, nullptr);
+  std::vector<VkQueueFamilyProperties> queue_family_properties(queue_family_count);
+  ifn.vkGetPhysicalDeviceQueueFamilyProperties(vulkan_device->physical_device(),
+                                               &queue_family_count,
+                                               queue_family_properties.data());
+  uint32_t gc_family = vulkan_device->queue_family_graphics_compute();
+  if (gc_family >= queue_family_count ||
+      queue_family_properties[gc_family].timestampValidBits == 0 ||
+      !(physical_properties.limits.timestampPeriod > 0.0f)) {
+    REXGPU_WARN("GE GPU timestamps unavailable (no timestamp support on the queue family)");
+    return;
+  }
+
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  VkQueryPoolCreateInfo pool_info = {};
+  pool_info.sType = VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO;
+  pool_info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+  pool_info.queryCount = kGeGpuTimestampSlots * 2;
+  if (dfn.vkCreateQueryPool(vulkan_device->device(), &pool_info, nullptr,
+                            &ge_gpu_timestamp_pool_) != VK_SUCCESS) {
+    REXGPU_WARN("GE GPU timestamps unavailable (query pool creation failed)");
+    ge_gpu_timestamp_pool_ = VK_NULL_HANDLE;
+    return;
+  }
+  ge_gpu_timestamp_period_ns_ = physical_properties.limits.timestampPeriod;
+  REXGPU_INFO("GE GPU timestamps enabled (period {}ns)", ge_gpu_timestamp_period_ns_);
+}
+
+void VulkanCommandProcessor::ShutdownGeGpuTimestampResources() {
+  if (ge_gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+    const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+    vulkan_device->functions().vkDestroyQueryPool(vulkan_device->device(),
+                                                  ge_gpu_timestamp_pool_, nullptr);
+    ge_gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  }
+}
+
+void VulkanCommandProcessor::ReadbackGeGpuTimestamps() {
+  if (ge_gpu_timestamp_pool_ == VK_NULL_HANDLE) {
+    return;
+  }
+  const ui::vulkan::VulkanDevice* vulkan_device = GetVulkanDevice();
+  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+  for (uint32_t slot = 0; slot < kGeGpuTimestampSlots; ++slot) {
+    uint64_t slot_submission = ge_gpu_timestamp_slot_submission_[slot];
+    if (slot_submission == 0 || submission_completed_ < slot_submission) {
+      continue;  // nothing pending, or the GPU hasn't retired it yet
+    }
+    uint64_t timestamps[2];
+    // No WAIT flag: the fence already retired, but be defensive -- on
+    // VK_NOT_READY just leave the slot pending for the next drain.
+    VkResult result = dfn.vkGetQueryPoolResults(
+        vulkan_device->device(), ge_gpu_timestamp_pool_, slot * 2, 2, sizeof(timestamps),
+        timestamps, sizeof(uint64_t), VK_QUERY_RESULT_64_BIT);
+    if (result == VK_NOT_READY) {
+      continue;
+    }
+    ge_gpu_timestamp_slot_submission_[slot] = 0;
+    if (result == VK_SUCCESS && timestamps[1] > timestamps[0]) {
+      PROFILE_GPU_FRAME_US(static_cast<int64_t>(
+          (timestamps[1] - timestamps[0]) * double(ge_gpu_timestamp_period_ns_) / 1000.0));
+    }
+  }
+}
+
 void VulkanCommandProcessor::ShutdownContext() {
   AwaitAllQueueOperationsCompletion();
   InvalidateAllVertexBufferResidency();
   ShutdownOcclusionQueryResources();
+  ShutdownGeGpuTimestampResources();
 
   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
@@ -5486,7 +5579,27 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
       REXGPU_ERROR("Failed to begin a Vulkan command buffer");
       return false;
     }
+    // GE GPU timestamps: drain retired pairs, then bracket this submission if
+    // its round-robin slot is free (a still-in-flight slot is skipped -- lost
+    // sample, never a reset-while-pending hazard).
+    ge_gpu_timestamp_written_this_submission_ = false;
+    if (ge_gpu_timestamp_pool_ != VK_NULL_HANDLE) {
+      ReadbackGeGpuTimestamps();
+      uint32_t slot = uint32_t(GetCurrentSubmission() % kGeGpuTimestampSlots);
+      if (ge_gpu_timestamp_slot_submission_[slot] == 0) {
+        dfn.vkCmdResetQueryPool(command_buffer.buffer, ge_gpu_timestamp_pool_, slot * 2, 2);
+        dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                ge_gpu_timestamp_pool_, slot * 2);
+        ge_gpu_timestamp_current_slot_ = slot;
+        ge_gpu_timestamp_written_this_submission_ = true;
+      }
+    }
     deferred_command_buffer_.Execute(command_buffer.buffer);
+    if (ge_gpu_timestamp_written_this_submission_) {
+      dfn.vkCmdWriteTimestamp(command_buffer.buffer, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                              ge_gpu_timestamp_pool_, ge_gpu_timestamp_current_slot_ * 2 + 1);
+      ge_gpu_timestamp_slot_submission_[ge_gpu_timestamp_current_slot_] = GetCurrentSubmission();
+    }
     if (dfn.vkEndCommandBuffer(command_buffer.buffer) != VK_SUCCESS) {
       REXGPU_ERROR("Failed to end a Vulkan command buffer");
       return false;

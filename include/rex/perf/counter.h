@@ -172,7 +172,7 @@ class Profiler {
 #define PROFILE_CP_WAIT_REG_MEM_US(v) PERF_counter_add(kCpWaitRegMemUs, v)
 #define PROFILE_PRESENT_BLOCK_US(v) PERF_counter_add(kPresentBlockUs, v)
 #define PROFILE_GUEST_GPU_WAIT_US(v) PERF_counter_add(kGuestGpuWaitUs, v)
-#define PROFILE_GPU_FRAME_US(v) PERF_counter_set(kGpuFrameUs, v)
+#define PROFILE_GPU_FRAME_US(v) PERF_counter_add(kGpuFrameUs, v)
 
 #else
 

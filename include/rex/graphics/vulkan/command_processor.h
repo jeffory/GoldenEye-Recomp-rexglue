@@ -440,6 +440,10 @@ class VulkanCommandProcessor : public CommandProcessor {
   void DestroyScratchBuffer();
   bool InitializeOcclusionQueryResources();
   void ShutdownOcclusionQueryResources();
+  void InitializeGeGpuTimestampResources();
+  void ShutdownGeGpuTimestampResources();
+  // Drain retired timestamp pairs into the kGpuFrameUs counter (never waits).
+  void ReadbackGeGpuTimestamps();
   bool BeginGuestOcclusionQuery(uint32_t sample_count_address);
   bool EndGuestOcclusionQuery(uint32_t sample_count_address);
   bool AcquireOcclusionQueryIndex(uint32_t& host_index_out);
@@ -767,6 +771,18 @@ class VulkanCommandProcessor : public CommandProcessor {
   // Backstop: if submissions stop completing, force a sync resolve rather than
   // letting the deferral queue (and host query-pool slots) grow without bound.
   static constexpr size_t kMaxPendingOcclusionResolves = 1024;
+
+  // GE GPU-time diagnostics (ge_gpu_timestamps cvar, default off): a TOP/BOTTOM
+  // vkCmdWriteTimestamp pair per submission, read back without waiting once the
+  // submission's fence has retired, accumulated into the kGpuFrameUs perf
+  // counter. Slots are reused round-robin; a slot whose previous pair hasn't
+  // retired yet is skipped for that submission (lost sample, never a hazard).
+  static constexpr uint32_t kGeGpuTimestampSlots = 32;
+  VkQueryPool ge_gpu_timestamp_pool_ = VK_NULL_HANDLE;
+  uint64_t ge_gpu_timestamp_slot_submission_[kGeGpuTimestampSlots] = {};
+  float ge_gpu_timestamp_period_ns_ = 0.0f;
+  bool ge_gpu_timestamp_written_this_submission_ = false;
+  uint32_t ge_gpu_timestamp_current_slot_ = 0;
   struct VertexBufferState {
     uint32_t address = UINT32_MAX;
     uint32_t size = UINT32_MAX;
