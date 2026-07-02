@@ -136,23 +136,85 @@ static bool ParseProcMapsLine(const std::string& line, LinuxMapEntry& out) {
   return out.start < out.end;
 }
 
-// Find the mapping entry in /proc/self/maps that contains the given address
+// Find the mapping entry in /proc/self/maps that contains the given address.
+//
+// ASYNC-SIGNAL-SAFE + allocation-free by construction: this runs inside the
+// SIGSEGV handler (MMIOHandler::ExceptionCallback -> QueryProtect) where
+// ifstream/std::string are not permitted -- and their cost is not academic: a
+// 23-minute Ayn Thor session locked up with a guest thread burning 78% of the
+// process's CPU re-running an ifstream/getline version of this parse on every
+// write-watch fault (the file has thousands of lines mid-session). Raw
+// open/read syscalls, fixed stack buffer, hand-rolled hex parse.
 static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(address);
-  std::ifstream maps("/proc/self/maps");
-  if (!maps.is_open())
+  int fd = open("/proc/self/maps", O_RDONLY | O_CLOEXEC);
+  if (fd < 0)
     return false;
-  std::string line;
-  while (std::getline(maps, line)) {
-    LinuxMapEntry e;
-    if (!ParseProcMapsLine(line, e))
-      continue;
-    if (addr >= e.start && addr < e.end) {
-      out_entry = e;
-      return true;
+  bool found = false;
+  char buf[4096];
+  char line[192];
+  size_t line_len = 0;
+  bool line_overflow = false;
+  for (;;) {
+    ssize_t n = read(fd, buf, sizeof(buf));
+    if (n <= 0)
+      break;
+    for (ssize_t i = 0; i < n && !found; ++i) {
+      char c = buf[i];
+      if (c != '\n') {
+        if (line_len < sizeof(line) - 1) {
+          line[line_len++] = c;
+        } else {
+          line_overflow = true;  // only the tail (pathname) can overflow
+        }
+        continue;
+      }
+      line[line_len] = '\0';
+      // Parse "start-end perms ..." without sscanf (keeps this handler-safe on
+      // libcs whose sscanf allocates).
+      const char* p = line;
+      uintptr_t start = 0, end = 0;
+      bool ok = false;
+      while (*p) {
+        unsigned d;
+        if (*p >= '0' && *p <= '9') d = unsigned(*p - '0');
+        else if (*p >= 'a' && *p <= 'f') d = unsigned(*p - 'a' + 10);
+        else break;
+        start = (start << 4) | d;
+        ++p;
+        ok = true;
+      }
+      if (ok && *p == '-') {
+        ++p;
+        ok = false;
+        while (*p) {
+          unsigned d;
+          if (*p >= '0' && *p <= '9') d = unsigned(*p - '0');
+          else if (*p >= 'a' && *p <= 'f') d = unsigned(*p - 'a' + 10);
+          else break;
+          end = (end << 4) | d;
+          ++p;
+          ok = true;
+        }
+      }
+      if (ok && *p == ' ' && start < end && addr >= start && addr < end) {
+        out_entry = LinuxMapEntry{};
+        out_entry.start = start;
+        out_entry.end = end;
+        for (int k = 0; k < 4 && p[1 + k] && p[1 + k] != ' '; ++k) {
+          out_entry.perms[k] = p[1 + k];
+        }
+        found = true;
+      }
+      line_len = 0;
+      line_overflow = false;
+      (void)line_overflow;
     }
+    if (found)
+      break;
   }
-  return false;
+  close(fd);
+  return found;
 }
 
 // Fast per-page protection shadow.
@@ -170,6 +232,11 @@ static bool FindEntryForAddress(void* address, LinuxMapEntry& out_entry) {
 // fast path for the pages the fault loop actually touches.
 std::mutex g_prot_shadow_mutex;
 std::unordered_map<uintptr_t, PageAccess> g_prot_shadow;
+
+// Cap for EAGER shadow population (AllocFixed): above this, pages memoize
+// lazily on first fault instead, so a multi-GB reservation doesn't turn into
+// millions of map entries at boot.
+constexpr size_t kShadowEagerMaxBytes = 4 * 1024 * 1024;
 
 static void ShadowSet(void* base_address, size_t length, PageAccess access) {
   const size_t ps = page_size();
@@ -298,6 +365,18 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
 
   void* result = mmap(base_address, length, prot_initial, flags, -1, 0);
   if (result != MAP_FAILED) {
+#if REX_PLATFORM_LINUX
+    // Record in the protection shadow so the write-watch fault path never has
+    // to fall back to parsing /proc/self/maps for these pages. Reservations
+    // are PROT_NONE regardless of the requested access. Bounded: shadowing a
+    // multi-GB reservation page-by-page would put millions of entries in the
+    // map; huge ranges memoize lazily instead (QueryProtect records a page the
+    // first time it faults), which caps the per-page maps-parse cost at once.
+    if (length <= kShadowEagerMaxBytes) {
+      ShadowSet(result, length,
+                allocation_type == AllocationType::kReserve ? PageAccess::kNoAccess : access);
+    }
+#endif
     return result;
   }
 #if defined(MAP_FIXED_NOREPLACE) && REX_PLATFORM_LINUX
@@ -309,6 +388,9 @@ void* AllocFixed(void* base_address, size_t length, AllocationType allocation_ty
     // Verify the entire range is mapped before using mprotect
     if (IsRangeFullyMapped(base_address, length)) {
       if (mprotect(base_address, length, static_cast<int>(prot_requested)) == 0) {
+        if (length <= kShadowEagerMaxBytes) {
+          ShadowSet(base_address, length, access);
+        }
         return base_address;
       }
     }
@@ -411,6 +493,14 @@ bool QueryProtect(void* base_address, size_t& length, PageAccess& access_out) {
   const uintptr_t addr = reinterpret_cast<uintptr_t>(base_address);
   length = static_cast<size_t>(e.end - addr);
   access_out = PermsToPageAccess(e.perms);
+
+  // Memoize: a page that fell through to the maps parse pays for it AT MOST
+  // once. All subsequent protection changes in the guest region funnel through
+  // Protect()/AllocFixed()/DeallocFixed(), which keep the shadow current, so
+  // the recorded value stays coherent. Without this, a page class that misses
+  // the shadow (observed live on the Ayn Thor) re-parses the entire maps file
+  // on EVERY write-watch fault -- thousands per frame -- and the game locks up.
+  ShadowSet(base_address, page_size(), access_out);
 
   return true;
 #endif
